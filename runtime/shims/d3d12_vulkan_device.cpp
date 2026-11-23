@@ -4220,13 +4220,15 @@ public:
                                                        [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
-            if (ambiguous)
+            if (ambiguous) {
+                // Ambiguous is not missing: translations exist, so it is refused even with LEONIDA_STUB_PIPELINES.
                 std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
                                      "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
-            else
-                std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
-                             fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
-                             leonida::sha256_hex(program.bytes).c_str());
+                return E_INVALIDARG;
+            }
+            std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
+                         fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
+                         leonida::sha256_hex(program.bytes).c_str());
             return stub_or(E_INVALIDARG, "compute");
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
