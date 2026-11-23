@@ -1720,7 +1720,7 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
         }
         if (state->capture_enabled &&
             (ok == 1 || ok == 10 || ok == 50 || ok == 100 || ok == 250 ||
-             (ok < 20000 ? (ok % 500 == 0) : (ok % 25 == 0)))) {
+             (ok < 20000 ? (ok % 500 == 0) : (ok % 10 == 0)))) {
             dump_present_frame(state, ok);
         }
     } else {
@@ -3938,9 +3938,8 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     D3D12_RESOURCE_DESC1 pc_desc = *xbox_desc;
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlagsMask);
+    const D3D12_RESOURCE_DESC norm = pc_resource_desc(desc_of(*xbox_desc));
+    std::memcpy(&pc_desc, &norm, sizeof(D3D12_RESOURCE_DESC));
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -3973,6 +3972,17 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
                           reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid, out);
         });
     static_cast<IUnknown*>(device10)->Release();
+    if (FAILED(hr)) {
+        static std::atomic<int> logged_fail{0};
+        if (logged_fail.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 127 FAILED hr=0x%08x (dim=%u fmt=%u %llux%ux%u mips=%u samples=%u flags=0x%x layout=0x%x init_layout=0x%x)\n",
+                         static_cast<unsigned>(hr), static_cast<unsigned>(xbox_desc->Dimension),
+                         static_cast<unsigned>(xbox_desc->Format), static_cast<unsigned long long>(xbox_desc->Width),
+                         static_cast<unsigned>(xbox_desc->Height), static_cast<unsigned>(xbox_desc->DepthOrArraySize),
+                         static_cast<unsigned>(xbox_desc->MipLevels), static_cast<unsigned>(xbox_desc->SampleDesc.Count),
+                         xbox_flags, xbox_layout, static_cast<unsigned>(layout_word));
+    }
     return hr;
 }
 
@@ -3995,16 +4005,12 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     // for clang-cl with SDK 10.0.26100 (found in review). The cast is applied to the masked value at run time.
     // The PC flags up to RAYTRACING_ACCELERATION_STRUCTURE (0x100) and USE_TIGHT_ALIGNMENT (0x400); 0x200 is
     // dropped, as committed_resource_refusal says the host refuses it (found in review).
-    constexpr std::uint32_t kPcResourceFlags = 0x5ff;
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
-    // Keep the linear layout word for the upload path. Use PC layouts for buffers and other textures.
-    if (pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    } else if (static_cast<UINT>(pc_desc.Layout) != kLinearTextureLayout) {
-        pc_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    }
+    const auto xbox_flags = static_cast<std::uint32_t>(xbox_desc->Flags);
+    const bool keep_linear =
+        xbox_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        static_cast<UINT>(xbox_desc->Layout) == kLinearTextureLayout;
+    D3D12_RESOURCE_DESC pc_desc = pc_resource_desc(*xbox_desc);
+    if (keep_linear) pc_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(kLinearTextureLayout);
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -4014,6 +4020,18 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      xbox_flags, state);
     }
     const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
+    if (FAILED(hr)) {
+        static std::atomic<int> logged_fail{0};
+        if (logged_fail.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133 FAILED hr=0x%08x (va=%p dim=%u fmt=%u %llux%ux%u mips=%u samples=%u flags=0x%x->0x%x layout=0x%x state=0x%x)\n",
+                         static_cast<unsigned>(hr), va, static_cast<unsigned>(xbox_desc->Dimension),
+                         static_cast<unsigned>(xbox_desc->Format), static_cast<unsigned long long>(xbox_desc->Width),
+                         static_cast<unsigned>(xbox_desc->Height), static_cast<unsigned>(xbox_desc->DepthOrArraySize),
+                         static_cast<unsigned>(xbox_desc->MipLevels), static_cast<unsigned>(xbox_desc->SampleDesc.Count),
+                         xbox_flags, static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned>(xbox_desc->Layout),
+                         state);
+    }
     if (SUCCEEDED(hr) && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && *out)
         remember_placed_buffer(self, reinterpret_cast<std::uintptr_t>(va), pc_desc.Width, *out);
     return hr;
