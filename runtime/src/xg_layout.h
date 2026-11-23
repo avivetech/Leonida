@@ -208,6 +208,10 @@ constexpr FormatInfo dxgi_format_info(std::uint32_t dxgi_format) {
     case 44: case 45: case 46: case 47:  // R24G8_TYPELESS, D24_UNORM_S8_UINT, R24_UNORM_X8, X24_TYPELESS_G8
         return {4, 1, 2, 1, true};
 
+    // Xbox 16-bit depth + 8-bit stencil (2 planes: 2-byte depth, 1-byte stencil)
+    case 117: case 118: case 119: case 120:  // R16G8_TYPELESS, D16_UNORM_S8_UINT, R16_UNORM_X8, X16_TYPELESS_G8
+        return {2, 1, 2, 1, true};
+
     // 2 bytes per texel (16 bpp)
     case 48: case 49: case 50: case 51: case 52:           // R8G8_*
     case 53: case 54: case 56: case 57: case 58: case 59:  // R16_* (except D16)

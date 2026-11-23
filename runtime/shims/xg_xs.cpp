@@ -145,6 +145,13 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc_ptr, void** out) {
     const auto& desc = *static_cast<const leonida::xg::XgResourceDesc*>(desc_ptr);
     leonida::xg::XgResourceLayout layout{};
     if (!leonida::xg::compute_resource_layout(desc, layout)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] xg_xs: XGCreateTextureComputer unsupported desc: dim=%u fmt=%u %llux%ux%u mips=%u samples=%u layout=0x%x flags=0x%x align=%llu\n",
+                         desc.dimension, desc.format, static_cast<unsigned long long>(desc.width), desc.height,
+                         desc.depth_or_array_size, desc.mip_levels, desc.sample_count, desc.layout, desc.flags,
+                         static_cast<unsigned long long>(desc.alignment));
         static std::atomic<bool> warned{false};
         warn_once(warned, "XGCreateTextureComputer", -1, "unsupported desc; returning E_INVALIDARG", _ReturnAddress());
         *out = &g_fallback_computer;  // two measured callers use *out without checking HRESULT

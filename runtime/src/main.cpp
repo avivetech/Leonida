@@ -38,7 +38,6 @@
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
-#include "../shims/xmem.h"
 
 namespace {
 
@@ -160,8 +159,6 @@ int wmain(int argc, wchar_t** argv) {
                                    "this executable (docs/modding.md)\n", leonida::mods::active().size());
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
-    // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
-    rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {
         std::fprintf(stderr, trace_error == EEXIST ? "error: the trace file already exists; --trace only creates a new file\n"
                                                    : "error: cannot create the trace file\n");
