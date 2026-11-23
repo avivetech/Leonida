@@ -2079,6 +2079,11 @@ private:
     bool in_arena_ = false;
 };
 
+// Textures by the title address they were made at (device slot 133) or took from the title's XMem hook, for device
+// slot 70, which names a texture by that address. Keyed by start; the value is (end, Resource as ID3D12Resource*).
+std::mutex g_title_textures_lock;
+std::map<std::uint64_t, std::pair<std::uint64_t, ID3D12Resource*>> g_title_textures;
+
 class Resource final
     : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
 public:
@@ -2096,6 +2101,12 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (title_va_) {
+            std::lock_guard<std::mutex> lock(g_title_textures_lock);
+            const auto it = g_title_textures.find(title_va_);
+            if (it != g_title_textures.end() && it->second.second == static_cast<ID3D12Resource*>(this))
+                g_title_textures.erase(it);
+        }
         if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
@@ -2721,7 +2732,18 @@ public:
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // A texture with a title address answers it, as the console does: the title passes it back to slot 70.
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        return accel_ ? gpu_va_ : va_ ? va_ : title_va_;
+    }
+
+    void set_title_va(std::uint64_t va, std::uint64_t bytes) {
+        if (title_va_ || va_ || desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return;
+        std::lock_guard<std::mutex> lock(g_title_textures_lock);
+        auto& slot = g_title_textures[va];
+        slot = {va + bytes, static_cast<ID3D12Resource*>(this)};
+        title_va_ = va;
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -3032,6 +3054,7 @@ private:
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
     std::uint64_t title_alias_ = 0;
+    std::uint64_t title_va_ = 0;  // a texture's title address (set_title_va), 0 for none
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -5477,6 +5500,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_title_texture_hooks(&register_title_texture, &add_ref_title_texture_at);
         rt::d3d12_xs::set_descriptor_handles_are_memory(true);
         rt::d3d12_xs::set_native_shader_directory_provider(&configured_shader_directory);  // slot 57's containers
         state_.info = info;
@@ -9363,6 +9387,20 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+void register_title_texture(ID3D12Resource* texture, std::uint64_t va, std::uint64_t bytes) {
+    if (auto* resource = Resource::from<Resource>(texture)) resource->set_title_va(va, bytes);
+}
+
+ID3D12Resource* add_ref_title_texture_at(std::uint64_t va) {
+    std::lock_guard<std::mutex> lock(g_title_textures_lock);
+    auto it = g_title_textures.upper_bound(va);
+    if (it == g_title_textures.begin()) return nullptr;
+    --it;
+    if (va >= it->second.first) return nullptr;
+    auto* resource = static_cast<Resource*>(it->second.second);
+    return resource->try_add_ref() ? it->second.second : nullptr;
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,

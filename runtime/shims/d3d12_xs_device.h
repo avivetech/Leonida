@@ -189,6 +189,12 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// Textures by title address, for slot 70: a texture made at slot 133 or through the title's XMem hook is registered
+// with that range (its GPU VA, as on the console), and slot 70 finds it again by an address inside it (add-ref'd).
+using TitleTextureRegistrar = void (*)(ID3D12Resource* texture, std::uint64_t va, std::uint64_t bytes);
+using TitleTextureLookup = ID3D12Resource* (*)(std::uint64_t va);
+void set_title_texture_hooks(TitleTextureRegistrar registrar, TitleTextureLookup lookup);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
 // console's struct-return form), 27 and 53 (committed resources, memory through the title's XMem hook),

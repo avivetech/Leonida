@@ -51,6 +51,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -2647,6 +2648,71 @@ void log_slot70_null_once(const char* why, std::uint64_t texture_words, std::uin
                      static_cast<unsigned long long>(texture_words), static_cast<unsigned long long>(view_desc));
 }
 
+std::atomic<TitleTextureRegistrar> g_title_texture_registrar{nullptr};
+std::atomic<TitleTextureLookup> g_title_texture_lookup{nullptr};
+
+// Slot 70 views of a title address no texture holds yet, by translated destination: the console writes a view from
+// the address alone, so a title may write it before it places the texture there (slot 133). Written when it does.
+struct PendingTextureView {
+    const DeviceProxy* device;
+    std::uint64_t va;
+    std::uint64_t title_destination;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view;
+};
+std::mutex g_pending_views_lock;
+std::map<std::uint64_t, PendingTextureView> g_pending_views;
+
+void forget_pending_view(std::uint64_t destination) {
+    std::lock_guard<std::mutex> lock(g_pending_views_lock);
+    g_pending_views.erase(destination);
+}
+
+// A texture shape (measured on retail: Texture2D, arrays and cubes) names its texture by the title address after the
+// view description, the address slot 133 placed it at or the XMem hook gave it (its GPU VA). The view is the title's
+// own desktop description on the texture registered there. False leaves the call to the buffer path.
+bool write_texture_srv(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
+                       std::uint64_t destination, std::uint64_t title_destination) {
+    if (!readable(texture_words, sizeof(D3D12_RESOURCE_DESC)) ||
+        !readable(view_desc, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS)))
+        return false;
+    D3D12_RESOURCE_DESC resource_desc{};
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    std::uint64_t va = 0;
+    std::memcpy(&resource_desc, reinterpret_cast<const void*>(texture_words), sizeof(resource_desc));
+    std::memcpy(&view, reinterpret_cast<const void*>(view_desc), sizeof(view));
+    std::memcpy(&va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(view), sizeof(va));
+    if (resource_desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+        resource_desc.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+        view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER ||
+        view.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+        return false;
+    static std::atomic<unsigned> found{0}, missed{0};
+    const TitleTextureLookup lookup = g_title_texture_lookup.load(std::memory_order_acquire);
+    ID3D12Resource* texture = lookup && va ? lookup(va) : nullptr;
+    if (!texture) {
+        if (va) {
+            std::lock_guard<std::mutex> lock(g_pending_views_lock);
+            g_pending_views[destination] = PendingTextureView{self, va, title_destination, view};
+        }
+        const unsigned n = missed.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 70 texture view: no texture at title address 0x%llx (%u so far, "
+                                 "%u found); null view\n",
+                         static_cast<unsigned long long>(va), n + 1, found.load(std::memory_order_relaxed));
+        write_null_srv(self, destination);
+        return true;
+    }
+    self->real->CreateShaderResourceView(texture, &view, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)});
+    texture->Release();
+    const unsigned n = found.fetch_add(1, std::memory_order_relaxed);
+    if (n < 4 || (n & (n - 1)) == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 texture view at title address 0x%llx (dimension %d, format %d; "
+                             "%u found, %u missed)\n",
+                     static_cast<unsigned long long>(va), static_cast<int>(view.ViewDimension),
+                     static_cast<int>(view.Format), n + 1, missed.load(std::memory_order_relaxed));
+    return true;
+}
+
 void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
                                  std::uint64_t destination) {
     note_slot(70);
@@ -2671,9 +2737,18 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
                          tw[3], tw[4], tw[5], tw[6], tw[7], tw[8], tw[9], tw[10], tw[11]);
         }
     }
-    // The console's CPU handle may be in a title-backed heap (#7021): translated before either write below.
+    // The console's CPU handle may be in a title-backed heap (#7021): translated before any write below, and every
+    // write mirrored back into that heap's own memory, which the submission's table pull copies from.
+    const std::uint64_t title_destination = destination;
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
+    struct Mirror {
+        const DeviceProxy* self;
+        std::uint64_t at;
+        ~Mirror() { mirror_title_descriptors(self, static_cast<SIZE_T>(at), 1); }
+    } mirror{self, title_destination};
 
+    forget_pending_view(destination);
+    if (write_texture_srv(self, texture_words, view_desc, destination, title_destination)) return;
     RawSrvShape shape{};
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
     if (why || !self->resource_provider) {
@@ -3293,6 +3368,34 @@ struct XmemBackingOwner final : IUnknown {
 // whose memory comes from the title's XMem hook are made on that memory through the same handler.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
 
+void register_title_texture(void* resource, const void* va, std::uint64_t bytes) {
+    const TitleTextureRegistrar registrar = g_title_texture_registrar.load(std::memory_order_acquire);
+    if (!registrar || !resource || !va || !bytes) return;
+    const std::uint64_t start = reinterpret_cast<std::uintptr_t>(va);
+    registrar(static_cast<ID3D12Resource*>(resource), start, bytes);
+    std::vector<std::pair<std::uint64_t, PendingTextureView>> ready;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_views_lock);
+        for (auto it = g_pending_views.begin(); it != g_pending_views.end();) {
+            if (it->second.va >= start && it->second.va - start < bytes) {
+                ready.emplace_back(it->first, it->second);
+                it = g_pending_views.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto& [destination, pending] : ready) {
+        pending.device->real->CreateShaderResourceView(static_cast<ID3D12Resource*>(resource), &pending.view,
+                                                       D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)});
+        mirror_title_descriptors(pending.device, static_cast<SIZE_T>(pending.title_destination), 1);
+    }
+    static std::atomic<unsigned> logged{0};
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0' && logged.fetch_add(1, std::memory_order_relaxed) < 64)
+        std::fprintf(stderr, "[red] title texture 0x%llx +0x%llx, %zu pending views written\n",
+                     static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes), ready.size());
+}
+
 struct XmemHooks {
     DescriptorHeapBackingAlloc alloc = nullptr;
     DescriptorHeapBackingFree free = nullptr;
@@ -3404,7 +3507,10 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
                          "[rt] d3d12_xs: slot %u resource memory through the title's XMem hook: %zu bytes, %s "
                          "(bookkeeping: the resource stays on the PC device's memory)\n",
                          slot, size, memory ? "allocated" : "refused");
-        if (memory) tie_xmem(*out, memory, hooks);
+        if (memory) {
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) register_title_texture(*out, memory, size);
+            tie_xmem(*out, memory, hooks);
+        }
         return hr;
     }
 
@@ -3644,7 +3750,10 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
     }
-    return handler(self->real, va, pc_desc, state, *riid, out);
+    const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
+    if (SUCCEEDED(hr) && *out && pc_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        register_title_texture(*out, va, xmem_size(self, pc_desc));
+    return hr;
 }
 
 // Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
@@ -4308,6 +4417,11 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_title_texture_hooks(TitleTextureRegistrar registrar, TitleTextureLookup lookup) {
+    g_title_texture_registrar.store(registrar, std::memory_order_release);
+    g_title_texture_lookup.store(lookup, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

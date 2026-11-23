@@ -232,6 +232,10 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // extension, or for a texture.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
+// Device slot 70's texture lookup (rt::d3d12_xs::set_title_texture_hooks): a texture's title address range, and the
+// texture holding an address, add-ref'd, or null.
+void register_title_texture(ID3D12Resource* texture, std::uint64_t va, std::uint64_t bytes);
+ID3D12Resource* add_ref_title_texture_at(std::uint64_t va);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 
