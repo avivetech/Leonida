@@ -461,6 +461,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_D16_UNORM: return {VK_FORMAT_D16_UNORM, d};
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return {VK_FORMAT_D24_UNORM_S8_UINT, ds};
+    case static_cast<DXGI_FORMAT>(118): return {VK_FORMAT_D24_UNORM_S8_UINT, ds};  // Xbox D16_UNORM_S8_UINT -> D24S8
     case DXGI_FORMAT_R32_TYPELESS:
         return depth ? Format{VK_FORMAT_D32_SFLOAT, d, true} : Format{VK_FORMAT_R32_SFLOAT, color, true};
     case DXGI_FORMAT_R16_TYPELESS:
@@ -4181,6 +4182,13 @@ public:
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
         recipe_.mesh = mesh;
+        recipe_.debug_names.clear();
+        for (const Stage& s : stages) {
+            if (s.entry) {
+                if (!recipe_.debug_names.empty()) recipe_.debug_names += " + ";
+                recipe_.debug_names += s.entry->name;
+            }
+        }
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
@@ -4340,7 +4348,8 @@ public:
 private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
-        bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
+        bool mesh = false;
+        std::string debug_names;  // no vertex input or input assembly state, and no dynamic topology or strides
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
@@ -4456,8 +4465,8 @@ private:
         static std::atomic<unsigned> built{0};
         const unsigned n = ++built;
         if (n <= 16 || (n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: lazily compiled graphics pipeline #%u (unbound=0x%x, stages=%zu)\n",
-                         n, unbound, recipe_.stages.size());
+            std::fprintf(stderr, "[rt] d3d12: lazily compiled graphics pipeline #%u (unbound=0x%x, stages=%zu: %s)\n",
+                         n, unbound, recipe_.stages.size(), recipe_.debug_names.c_str());
         return pipeline;
     }
 

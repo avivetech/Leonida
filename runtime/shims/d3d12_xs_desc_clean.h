@@ -55,6 +55,21 @@ inline bool is_depth_resource_format(DXGI_FORMAT format) {
     }
 }
 
+inline bool is_srgb_resource_format(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Strip Xbox-only flags and preserve the three supported PC layouts. In addition to 0x101, zebraso measured
 // layout words 0x102 and 0x105 reaching slot 25 during a retail boot.
 inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
@@ -66,7 +81,8 @@ inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
     std::uint32_t flags = pc_resource_flags(xbox.Dimension, static_cast<std::uint32_t>(xbox.Flags));
-    if (pc.Format == DXGI_FORMAT_B5G5R5A1_UNORM || is_depth_resource_format(pc.Format)) {
+    if (pc.Format == DXGI_FORMAT_B5G5R5A1_UNORM || is_depth_resource_format(pc.Format) ||
+        is_srgb_resource_format(pc.Format)) {
         flags &= ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     }
     pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
