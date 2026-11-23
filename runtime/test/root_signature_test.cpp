@@ -463,7 +463,7 @@ int main() {
         const StagePackResult f2 = pack_stage(full, Stage::Compute);
         check(!f2.ok && f2.first_sgpr.empty() && f2.resource_heap_sgpr == kNoSgpr &&
                   f2.error.find("sampler heap base") != std::string::npos &&
-                  f2.error.find("spill") != std::string::npos,
+                  f2.error.find("spill") != std::string::npos && f2.spills,
               "pack_stage: a heap base that does not fit is refused and named");
     }
 
@@ -476,8 +476,11 @@ int main() {
         over.params = {consts(27), view()};  // the view would need s31..s32
         const StagePackResult r = pack_stage(over, Stage::Compute);
         check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
-                  r.error.find("spill") != std::string::npos,
+                  r.error.find("spill") != std::string::npos && r.spills,
               "pack_stage: a parameter that does not fit whole is refused and named");
+        // The same signature fits the graphics stages from s8 only up to 24 SGPRs: a spill there too, still valid.
+        const StagePackResult g = pack_stage(over, Stage::Pixel);
+        check(!g.ok && g.spills, "pack_stage: a valid signature that spills from s8 is marked as a spill");
         RootSignature fits_old;
         fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
         check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
@@ -496,15 +499,23 @@ int main() {
     {
         RootSignature zero;
         zero.params = {consts(0)};
-        check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
-        // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
-        // 64-dword cost limit can; an over-cost signature is refused all the same.
+        check(!pack_stage(zero, Stage::Compute).ok && !pack_stage(zero, Stage::Compute).spills,
+              "pack_stage: zero-value constants rejected");
+        // The first parameter already spills, but the signature is invalid (over the 64-dword cost limit), and
+        // that is what pack_stage reports: an invalid signature is never taken for one that only spills.
         RootSignature costly;
         costly.params = {consts(40), consts(30)};
-        check(!pack_stage(costly, Stage::Compute).ok, "pack_stage: over-cost signature refused");
+        const StagePackResult c = pack_stage(costly, Stage::Compute);
+        check(!c.ok && !c.spills && c.error.find("cost limit") != std::string::npos,
+              "pack_stage: over-cost signature refused as invalid, not as a spill");
+        RootSignature late;
+        late.params = {consts(30), consts(35)};  // spills at parameter 0, over the cost limit at parameter 1
+        check(!pack_stage(late, Stage::Compute).ok && !pack_stage(late, Stage::Compute).spills,
+              "pack_stage: an invalid parameter after a spill is still found");
         RootSignature many;
         many.params.assign(65, table());
-        check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+        check(!pack_stage(many, Stage::Compute).ok && !pack_stage(many, Stage::Compute).spills,
+              "pack_stage: more than 64 parameters rejected");
     }
 
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);

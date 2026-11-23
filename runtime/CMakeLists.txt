@@ -2669,11 +2669,13 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_buffer_uav COMMAND d3d12_buffer_uav_test)
       set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
 
-      # Direct heap indexing in compute: cs_heap_index.asm loads V#s from the bound CBV/SRV/UAV heap's base, which the
-      # list writes after the root arguments when the root signature has CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.
+      # Direct heap indexing: cs_heap_index.asm and ps_heap_index.asm load V#s from the bound CBV/SRV/UAV heap's base,
+      # which the list writes after the root arguments when the root signature has CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.
       set(LEONIDA_HEAP_INDEX_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/heap_index_shaders)
       set(LEONIDA_HEAP_INDEX_FILES ${LEONIDA_HEAP_INDEX_DIR}/spirv/index.json
-                                   ${LEONIDA_HEAP_INDEX_DIR}/fssm/cs_heap_index.fssm)
+                                   ${LEONIDA_HEAP_INDEX_DIR}/fssm/cs_heap_index.fssm
+                                   ${LEONIDA_HEAP_INDEX_DIR}/fssm/vs_m2.fssm
+                                   ${LEONIDA_HEAP_INDEX_DIR}/fssm/ps_heap_index.fssm)
       add_custom_command(
         OUTPUT ${LEONIDA_HEAP_INDEX_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_HEAP_INDEX_DIR}
@@ -2681,12 +2683,14 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${LEONIDA_HEAP_INDEX_DIR} cs_heap_index
+                ${LEONIDA_HEAP_INDEX_DIR} cs_heap_index vs_m2 ps_heap_index
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_heap_index.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_heap_index.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
-        COMMENT "Translating cs_heap_index for the heap index test"
+        COMMENT "Translating cs_heap_index, vs_m2 and ps_heap_index for the heap index test"
         VERBATIM)
       add_executable(d3d12_heap_index_test test/d3d12_heap_index_test.cpp ${LEONIDA_HEAP_INDEX_FILES})
       target_link_libraries(d3d12_heap_index_test PRIVATE gta6rt_d3d12_com)

@@ -176,6 +176,9 @@ constexpr uint32_t kFlagSamplerHeapDirectlyIndexed = 0x800;
 struct StagePackResult {
     bool ok = false;
     std::string error;            // set when !ok; names the refusing parameter
+    // !ok only because a parameter or heap base would spill (a valid D3D12 signature whose spill array is not
+    // modelled), not because the signature breaks a D3D12 limit.
+    bool spills = false;
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
     std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
