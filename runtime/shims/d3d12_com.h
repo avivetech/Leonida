@@ -228,8 +228,7 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 
 // Xbox device slot 133 (the console's CreatePlacedResourceX): a buffer on the caller's own pages at `address`, which
 // becomes its console VA. The pages are imported with VK_EXT_external_memory_host, so what the CPU writes there is
-// what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
-// extension, or for a texture.
+// what the GPU reads. For a shader-readable linear 2D texture, the image holds a copy of the initial texels.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.

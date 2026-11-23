@@ -236,12 +236,46 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     return 0;
 }
 
+int check_title_placed_linear_texture(ID3D12Device* device, void* pages) {
+    const char* who = "vulkan slot-133 linear texture";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 37;
+    desc.Height = 5;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 2;
+    desc.Format = DXGI_FORMAT_A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    const UINT layout = 0x100;
+    static_assert(sizeof(desc.Layout) == sizeof(layout));
+    std::memcpy(&desc.Layout, &layout, sizeof(layout));
+
+    auto* bytes = static_cast<std::uint8_t*>(pages);
+    std::memset(bytes, 0x11, 0x800);
+    for (UINT row = 0; row < 5; ++row) std::memset(bytes + 0x100 * row, 0x53 + row, 37);
+    for (UINT row = 0; row < 2; ++row) std::memset(bytes + 0x600 + 0x100 * row, 0xb2 + row, 18);
+
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0x6u, IID_PPV_ARGS(&texture.p)), S_OK);
+    std::uint8_t main_mip[5][37]{};
+    std::uint8_t next_mip[2][18]{};
+    EXPECT_HR(texture->ReadFromSubresource(main_mip, 37, 0, 0, nullptr), S_OK);
+    EXPECT_HR(texture->ReadFromSubresource(next_mip, 18, 0, 1, nullptr), S_OK);
+    for (UINT row = 0; row < 5; ++row)
+        for (const auto pixel : main_mip[row]) EXPECT(pixel == 0x53 + row);
+    for (UINT row = 0; row < 2; ++row)
+        for (const auto pixel : next_mip[row]) EXPECT(pixel == 0xb2 + row);
+    std::printf("%s: copied both mip levels from the title's pages\n", who);
+    return 0;
+}
+
 int check_title_placed_all(ID3D12Device* device) {
     constexpr SIZE_T size = 4 * 0x10000;
     int failures = 0;
     void* pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!pages) return 1;
     failures += check_title_placed(device, "VirtualAlloc range", pages, size);
+    failures += check_title_placed_linear_texture(device, pages);
     // Inside a page, as the title places small UAV buffers (64-byte aligned, found in review on an RTX 5090): the
     // import starts at the page and the buffer is bound at the offset.
     failures += check_title_placed(device, "64 bytes into a page", static_cast<char*>(pages) + 64, 0x1000 - 64);

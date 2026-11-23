@@ -726,13 +726,23 @@ int check_levels() {
             void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
             const HRESULT r133 = hr_of(raw(device, 133, word(va), word(&xbox_desc), 0xFFFFFFFFull, 0,
                                            word(&resource_iid), word(&placed)));
-            xs::set_placed_at_va_handler(nullptr);
             EXPECT(r133 == S_OK && placed == reinterpret_cast<void*>(0x1330));
             EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va);
             EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
             EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
             EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
+            xbox_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            xbox_desc.Width = 37;
+            xbox_desc.Height = 5;
+            xbox_desc.Format = DXGI_FORMAT_A8_UNORM;
+            xbox_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            const UINT xbox_layout = xs::kLinearTextureLayout;
+            std::memcpy(&xbox_desc.Layout, &xbox_layout, sizeof(xbox_layout));
+            const HRESULT linear = hr_of(raw(device, 133, word(va), word(&xbox_desc), 6, 0,
+                                               word(&resource_iid), word(&placed)));
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(linear == S_OK && static_cast<UINT>(seen_desc.Layout) == xbox_layout && seen_layout == 6);
             EXPECT(xs::device_slot_overridden(133));
         }
 

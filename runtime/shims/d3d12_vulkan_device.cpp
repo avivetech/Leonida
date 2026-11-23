@@ -7197,6 +7197,48 @@ public:
         return size != 0;
     }
 
+    // Slot 133's linear shader-readable textures use padded rows and subresource offsets. Copy the texels
+    // present at placement time into a Vulkan image.
+    HRESULT create_linear_texture_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc,
+                                                  REFIID riid, void** out) {
+        if (!address || allocation(desc).SizeInBytes == UINT64_MAX) return E_INVALIDARG;
+        if (state_.texture_format(desc).aspects != VK_IMAGE_ASPECT_COLOR_BIT) return E_NOTIMPL;
+        const UINT mip_count = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, 1);
+        if (!mip_count || mip_count > D3D12_REQ_MIP_LEVELS) return E_INVALIDARG;
+
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_REQ_MIP_LEVELS> footprints{};
+        UINT64 size = 0;
+        GetCopyableFootprints(&desc, 0, mip_count, 0, footprints.data(), nullptr, nullptr, &size);
+        const auto base = reinterpret_cast<std::uintptr_t>(address);
+        if (!size || size == UINT64_MAX || size > UINTPTR_MAX - base) return E_INVALIDARG;
+        for (auto cursor = base; cursor < base + size;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) ||
+                region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                return E_INVALIDARG;
+            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            if (end <= cursor) return E_INVALIDARG;
+            cursor = end;
+        }
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        ID3D12Resource* texture = nullptr;
+        HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
+                                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture));
+        if (FAILED(hr)) return hr;
+        for (UINT mip = 0; mip < mip_count && SUCCEEDED(hr); ++mip) {
+            const auto& layout = footprints[mip];
+            const auto* texels = static_cast<const std::byte*>(address) + layout.Offset;
+            hr = texture->WriteToSubresource(mip, nullptr, texels, layout.Footprint.RowPitch, 0);
+        }
+        if (SUCCEEDED(hr)) hr = texture->QueryInterface(riid, out);
+        texture->Release();
+        return hr;
+    }
+
     // create_buffer_at_host_address (Xbox device slot 133). The heap the resource reports is CUSTOM / WRITE_BACK / L0,
     // what OpenExistingHeapFromAddress gives the same pages, since the CPU keeps writing them.
     // A D3D12_BARRIER_LAYOUT (what Xbox slot 133 passes, as PC CreatePlacedResource2 does) as the legacy initial state
@@ -7221,9 +7263,16 @@ public:
                                    void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
-            // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
-            // review). What the title writes at `address` does not reach it.
+            D3D12_RESOURCE_DESC pc_desc = desc;
+            pc_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            if (static_cast<UINT>(desc.Layout) == rt::d3d12_xs::kLinearTextureLayout &&
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 &&
+                desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE &&
+                layout == D3D12_BARRIER_LAYOUT_SHADER_RESOURCE) {
+                return d3d12_trace::result("Xbox CreatePlacedResourceX (linear texture)",
+                                           create_linear_texture_at_host_address(address, pc_desc, riid, out));
+            }
+            // Other textures use the existing committed DEFAULT backing.
             log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
                      "dimension",
                      int(desc.Dimension));
@@ -7231,9 +7280,9 @@ public:
             // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
-            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
+            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &pc_desc, initial, 0, nullptr, riid, out);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
-                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
+                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &pc_desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
                                       riid, out);
             return d3d12_trace::result(method, hr);
         }
