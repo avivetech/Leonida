@@ -183,11 +183,16 @@ bool readable_memory(SIZE_T start, SIZE_T size) {
     return true;
 }
 
+// Set by a layer whose CPU descriptor handles are addresses of its heap storage (the Vulkan layer): its shader-visible
+// heaps live in mapped GPU memory, which VirtualQuery under Wine does not report as committed.
+std::atomic<bool> g_handles_are_memory{false};
+
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
                                SIZE_T byte_size, SIZE_T real_start, UINT stride) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
         return false;
-    const bool mirror = stride != 0 && byte_size % stride == 0 && readable_memory(real_start, byte_size);
+    const bool mirror = stride != 0 && byte_size % stride == 0 &&
+                        (g_handles_are_memory.load(std::memory_order_acquire) || readable_memory(real_start, byte_size));
     if (!mirror) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
@@ -196,6 +201,10 @@ bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap,
     }
     try {
         std::lock_guard lock(descriptor_range_mutex());
+        if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0')
+            std::fprintf(stderr, "[red] backed heap title=%llx bytes=%llx layer=%llx stride=%u mirror=%d\n",
+                         (unsigned long long)custom_start, (unsigned long long)byte_size, (unsigned long long)real_start,
+                         stride, int(mirror));
         descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap, stride,
                                        mirror});
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
@@ -251,6 +260,28 @@ void mirror_title_descriptors(const DeviceProxy* device, SIZE_T title_ptr, UINT 
         std::memcpy(reinterpret_cast<void*>(title_ptr),
                     reinterpret_cast<const void*>(it->real_start + (title_ptr - it->custom_start)),
                     wanted < room ? wanted : room);
+        return;
+    }
+}
+
+// The title-written direction of the mirror: the GPU reads the layer's heap, the title stores descriptors into its
+// backing with the CPU, so a bound table's span is copied from the backing before the submission that reads it.
+void pull_title_descriptors_locked(SIZE_T real_ptr, SIZE_T bytes) {
+    for (auto it = descriptor_ranges().rbegin(); it != descriptor_ranges().rend(); ++it) {
+        const SIZE_T size = it->custom_end - it->custom_start;
+        if (real_ptr < it->real_start || real_ptr - it->real_start >= size) continue;
+        if (!it->mirror) return;
+        const SIZE_T off = real_ptr - it->real_start;
+        if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+            static std::atomic<int> left{400};
+            if (left.fetch_sub(1) > 0) {
+                const auto* d = reinterpret_cast<const std::uint32_t*>(it->custom_start + off);
+                std::fprintf(stderr, "[red] pull off=%llx bytes=%llu backing: %x %x %x %x %x %x %x %x\n",
+                             (unsigned long long)off, (unsigned long long)bytes, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+            }
+        }
+        std::memcpy(reinterpret_cast<void*>(real_ptr), reinterpret_cast<const void*>(it->custom_start + off),
+                    bytes < size - off ? bytes : size - off);
         return;
     }
 }
@@ -2621,6 +2652,25 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     note_slot(70);
     log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
     if (!destination) return;
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+        static std::atomic<int> left{300};
+        if (left.fetch_sub(1) > 0 && readable(texture_words, sizeof(D3D12_RESOURCE_DESC)) &&
+            readable(view_desc, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + 8)) {
+            D3D12_RESOURCE_DESC r{};
+            D3D12_SHADER_RESOURCE_VIEW_DESC w{};
+            std::uint64_t va = 0;
+            std::memcpy(&r, reinterpret_cast<const void*>(texture_words), sizeof(r));
+            std::memcpy(&w, reinterpret_cast<const void*>(view_desc), sizeof(w));
+            std::memcpy(&va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(w), 8);
+            const auto* tw = reinterpret_cast<const std::uint32_t*>(texture_words);
+            std::fprintf(stderr, "[red] s70 dst=%llx res dim=%u w=%llu h=%u d=%u mips=%u fmt=%u | view fmt=%u dim=%u map=%x | "
+                                 "va=%llx | tw %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                         (unsigned long long)destination, unsigned(r.Dimension), (unsigned long long)r.Width, r.Height,
+                         unsigned(r.DepthOrArraySize), unsigned(r.MipLevels), unsigned(r.Format), unsigned(w.Format),
+                         unsigned(w.ViewDimension), w.Shader4ComponentMapping, (unsigned long long)va, tw[0], tw[1], tw[2],
+                         tw[3], tw[4], tw[5], tw[6], tw[7], tw[8], tw[9], tw[10], tw[11]);
+        }
+    }
     // The console's CPU handle may be in a title-backed heap (#7021): translated before either write below.
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
 
@@ -2915,6 +2965,23 @@ void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D
     mirror_title_descriptors(self, dest.ptr, 1);
 }
 
+// A copy source in a title-backed heap whose device writes are mirrored is read from the title's backing: that is
+// where the title's own CPU stores land, and the mirror keeps the layer's writes there too.
+D3D12_CPU_DESCRIPTOR_HANDLE copy_source_handle(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (handle.ptr == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return handle;
+    {
+        std::lock_guard lock(descriptor_range_mutex());
+        const auto& ranges = descriptor_ranges();
+        for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+            if (device && it->device != device) continue;
+            if (handle.ptr < it->custom_start || handle.ptr >= it->custom_end) continue;
+            if (it->mirror) return handle;
+            break;
+        }
+    }
+    return translate_cpu_handle(device, handle);
+}
+
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
                             const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
                             const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -2946,7 +3013,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
                 src_heap.resize(num_src);
                 src = src_heap.data();
             }
-            for (UINT i = 0; i < num_src; ++i) src[i] = translate_cpu_handle(self, src_starts[i]);
+            for (UINT i = 0; i < num_src; ++i) src[i] = copy_source_handle(self, src_starts[i]);
             src_out = src;
         }
     } catch (const std::bad_alloc&) {
@@ -2962,8 +3029,14 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
                                    D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     note_slot(24);
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+        static std::atomic<int> left{300};
+        if (left.fetch_sub(1) > 0)
+            std::fprintf(stderr, "[red] s24 n=%u dst=%llx src=%llx type=%u\n", num_descriptors,
+                         (unsigned long long)dest_start.ptr, (unsigned long long)src_start.ptr, unsigned(type));
+    }
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
-                                      translate_cpu_handle(self, src_start), type);
+                                      copy_source_handle(self, src_start), type);
     mirror_title_descriptors(self, dest_start.ptr, num_descriptors);
 }
 
@@ -4213,6 +4286,14 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
     if (g_heap_alloc_explicit) return;
     g_heap_alloc = alloc;
     g_heap_free = free;
+}
+
+void set_descriptor_handles_are_memory(bool yes) { g_handles_are_memory.store(yes, std::memory_order_release); }
+
+void pull_title_descriptors(SIZE_T real_ptr, SIZE_T bytes) {
+    if (real_ptr == 0 || bytes == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    pull_title_descriptors_locked(real_ptr, bytes);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {

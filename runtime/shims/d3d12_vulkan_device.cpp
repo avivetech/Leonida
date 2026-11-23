@@ -5477,6 +5477,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_descriptor_handles_are_memory(true);
         rt::d3d12_xs::set_native_shader_directory_provider(&configured_shader_directory);  // slot 57's containers
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);

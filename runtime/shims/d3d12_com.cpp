@@ -244,6 +244,8 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
+    // The layer-heap spans of those tables (CPU address, bytes), pulled from a title-backed heap's backing first.
+    const std::vector<std::pair<std::uintptr_t, std::uint32_t>>& table_spans() const { return table_spans_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -281,6 +283,7 @@ public:
         invalid_ = false;
         calls_.clear();
         tables_.clear();
+        table_spans_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -1265,6 +1268,7 @@ private:
             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
         else if (va && p->table_descriptors && (tables_.empty() || tables_.back().first != va))
             tables_.push_back({va, p->table_descriptors});
+        if (type == rt::rootsig::ParamType::Table && va) note_table_span(va, p->table_descriptors);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // A descriptor table is one dword at both bind points, the 32-bit VA of its first descriptor (the heaps live
@@ -1292,6 +1296,32 @@ private:
     leonida::IndexBufferView index_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    std::vector<std::pair<std::uintptr_t, std::uint32_t>> table_spans_;
+    struct HeapSpan {
+        D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+        std::uintptr_t cpu = 0;
+        std::uint64_t bytes = 0;
+    };
+    HeapSpan cbv_span_{}, sampler_span_{};
+
+    static HeapSpan heap_span(ID3D12DescriptorHeap* heap, D3D12_GPU_VIRTUAL_ADDRESS base) {
+        if (!heap) return {};
+        return {base, heap->GetCPUDescriptorHandleForHeapStart().ptr,
+                std::uint64_t(heap->GetDesc().NumDescriptors) * descriptor_size};
+    }
+
+    // A table's slots (a sampler table, which declares none here, takes 64) as a span of the bound heap holding it.
+    void note_table_span(std::uint64_t va, std::uint32_t descriptors) {
+        for (const HeapSpan& h : {cbv_span_, sampler_span_}) {
+            if (!h.cpu || va < h.gpu || va - h.gpu >= h.bytes) continue;
+            const std::uint64_t off = va - h.gpu;
+            const std::uint64_t want = std::uint64_t(descriptors ? descriptors : 64) * descriptor_size;
+            const std::uintptr_t cpu = h.cpu + std::uintptr_t(off);
+            if (table_spans_.empty() || table_spans_.back().first != cpu)
+                table_spans_.push_back({cpu, std::uint32_t(std::min(want, h.bytes - off))});
+            return;
+        }
+    }
     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
     static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
@@ -1361,6 +1391,8 @@ private:
         cbv_srv_uav_base_ = cbv_base;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        cbv_span_ = heap_span(cbv, cbv_base);
+        sampler_span_ = heap_span(smp, smp_base);
         if (red_diag())
             std::fprintf(stderr, "[red] heaps cbv=%p base=%llx smp=%p base=%llx\n", (void*)cbv,
                          (unsigned long long)cbv_base, (void*)smp, (unsigned long long)smp_base);
@@ -1427,6 +1459,7 @@ private:
         sampler_heap_ = nullptr;
         cbv_srv_uav_base_ = 0;
         sampler_base_ = 0;
+        cbv_span_ = sampler_span_ = {};
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1490,6 +1523,16 @@ private:
                          render_target_count_, count, instances, viewport_.width, viewport_.height, data[0], data[1], data[2], data[3], data[4],
                          data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14],
                          data[15]);
+        if (red_diag() && cbv_srv_uav_heap_ && data[8] >= std::uint32_t(cbv_srv_uav_base_)) {
+            const D3D12_DESCRIPTOR_HEAP_DESC hd = cbv_srv_uav_heap_->GetDesc();
+            const std::uint64_t off = data[8] - std::uint32_t(cbv_srv_uav_base_);
+            if (off + 32 <= std::uint64_t(hd.NumDescriptors) * descriptor_size) {
+                const auto* d = reinterpret_cast<const std::uint32_t*>(
+                    cbv_srv_uav_heap_->GetCPUDescriptorHandleForHeapStart().ptr + off);
+                std::fprintf(stderr, "[red] table @%llx: %x %x %x %x %x %x %x %x\n", (unsigned long long)off, d[0], d[1],
+                             d[2], d[3], d[4], d[5], d[6], d[7]);
+            }
+        }
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
@@ -1712,6 +1755,9 @@ public:
         }
         // Buffer V#s the title wrote into a bound table itself may name its own memory: rewritten to a GPU copy's
         // console VA before the copies are refreshed for this submission (src/title_va_alias.h).
+        // Descriptors the title stored into a title-backed heap's memory reach the layer heap the GPU reads.
+        for (const GraphicsCommandList* list : graphics)
+            for (const auto& [cpu, bytes] : list->table_spans()) rt::d3d12_xs::pull_title_descriptors(cpu, bytes);
         {
             std::map<std::uint64_t, std::uint32_t> tables;  // each table once, with the most slots it was bound with
             for (const GraphicsCommandList* list : graphics)

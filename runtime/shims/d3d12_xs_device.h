@@ -167,6 +167,11 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
 // Translates a CPU descriptor handle from a title-backed descriptor heap to the underlying PC/Vulkan heap handle.
 // Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+// A layer whose CPU descriptor handles are addresses of its heap storage says so; title-backed heaps then mirror.
+void set_descriptor_handles_are_memory(bool yes);
+// Copies `bytes` at a layer heap address from the title-backed heap's backing at the same offset (clamped to the
+// heap); nothing when the address is in no mirrored title-backed heap.
+void pull_title_descriptors(SIZE_T real_ptr, SIZE_T bytes);
 
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
