@@ -251,6 +251,8 @@ void forget_placed_buffer(std::uint64_t id) {
     g_placed_buffer_count.store(buffers.size(), std::memory_order_release);
 }
 
+void forget_title_page_buffers_of(const DeviceProxy* device);  // slot 70's buffers on the title's pages, further down
+
 void forget_placed_buffers_of(const DeviceProxy* device) {
     if (g_placed_buffer_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(placed_buffer_mutex());
@@ -567,6 +569,7 @@ unsigned long proxy_release(DeviceProxy* self) {
         destroy_present_state(self->present_state);
         destroy_upload_state(self->upload_state.load(std::memory_order_relaxed));
         forget_placed_buffers_of(self);
+        forget_title_page_buffers_of(self);
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -2647,6 +2650,98 @@ void log_slot70_null(const char* why, std::uint64_t texture_words, std::uint64_t
                  static_cast<unsigned long long>(texture_words), static_cast<unsigned long long>(view_desc));
 }
 
+// ---- Buffers slot 70 asks for on the title's own pages ----
+//
+// A buffer view whose VA no placed buffer and no provider holds names bytes the title keeps in its own memory (the
+// two typed R16_UINT views of the retail boot). The device behind the proxy makes buffers on the title's pages for
+// slot 133 (set_placed_at_va_handler); slot 70 asks the same handler for [va, va + Width), so the GPU reads what the
+// CPU writes there, then and later. The proxy asks once per device and range and holds the buffer, because the
+// descriptors slot 70 wrote name it: it lives as long as the device. Without a handler (a PC device behind the
+// proxy), or when the handler refuses the range, the view stays null.
+PlacedAtVaHandler placed_at_va_handler();  // slot 133's handler, further down
+
+struct TitlePageBuffer {
+    const DeviceProxy* device;
+    std::uint64_t va;
+    std::uint64_t size;
+    ID3D12Resource* resource;  // referenced
+};
+
+std::mutex& title_page_buffer_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<TitlePageBuffer>& title_page_buffers() {
+    static auto* v = new std::vector<TitlePageBuffer>;
+    return *v;
+}
+
+void forget_title_page_buffers_of(const DeviceProxy* device) {
+    std::vector<ID3D12Resource*> dead;
+    {
+        std::lock_guard lock(title_page_buffer_mutex());
+        auto& buffers = title_page_buffers();
+        for (const TitlePageBuffer& buffer : buffers)
+            if (buffer.device == device) dead.push_back(buffer.resource);
+        std::erase_if(buffers, [device](const TitlePageBuffer& buffer) { return buffer.device == device; });
+    }
+    for (ID3D12Resource* resource : dead) resource->Release();
+}
+
+// A buffer on the title's pages that holds [va, va + width), made the first time, with a reference added for the
+// caller; `start` and `size` its range. Null, with `why`, when there is no handler or it refuses.
+ID3D12Resource* add_ref_title_page_buffer(DeviceProxy* self, std::uint64_t va, std::uint64_t width,
+                                          std::uint64_t* start, std::uint64_t* size, const char*& why) {
+    const PlacedAtVaHandler handler = placed_at_va_handler();
+    if (!handler) {
+        why = "no buffer holds the address, and the device behind the proxy makes none on the title's pages";
+        return nullptr;
+    }
+    std::lock_guard lock(title_page_buffer_mutex());
+    auto& buffers = title_page_buffers();
+    for (const TitlePageBuffer& buffer : buffers) {
+        if (buffer.device != self || va < buffer.va || va - buffer.va > buffer.size ||
+            width > buffer.size - (va - buffer.va))
+            continue;
+        buffer.resource->AddRef();
+        *start = buffer.va;
+        *size = buffer.size;
+        return buffer.resource;
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = width;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* made = nullptr;
+    // 0xFFFFFFFF: D3D12_BARRIER_LAYOUT_UNDEFINED, what slot 133 passes for a buffer.
+    if (FAILED(handler(self->real, reinterpret_cast<void*>(va), desc, 0xFFFFFFFFu, __uuidof(ID3D12Resource), &made)) ||
+        !made) {
+        why = "no buffer holds the address, and the device behind the proxy refused one on the title's pages";
+        return nullptr;
+    }
+    auto* const resource = static_cast<ID3D12Resource*>(made);
+    try {
+        buffers.push_back(TitlePageBuffer{self, va, width, resource});
+    } catch (const std::bad_alloc&) {
+        resource->Release();
+        why = "no memory to remember a buffer on the title's pages";
+        return nullptr;
+    }
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 made a buffer on the title's pages for a view (%llu bytes)\n",
+                     static_cast<unsigned long long>(width));
+    resource->AddRef();
+    *start = va;
+    *size = width;
+    return resource;
+}
+
 // The buffer shapes: a view of [va, va + Width) of the buffer that holds va. Returns null when it wrote the view, else
 // why it did not (nothing is written then).
 const char* write_buffer_srv(DeviceProxy* self, const SrvWords& shape, std::uint64_t destination) {
@@ -2676,15 +2771,20 @@ const char* write_buffer_srv(DeviceProxy* self, const SrvWords& shape, std::uint
         view.Format = shape.view.Format;
     }
     // The buffer the title placed over this address through slot 133, whatever the PC resource's own address is;
-    // then a buffer the device behind the proxy knows at that address.
+    // then a buffer the device behind the proxy knows at that address; then one made on the title's own pages.
     std::uint64_t start = 0, size = 0;
     ID3D12Resource* resource = add_ref_placed_buffer(self, shape.va, &start, &size);
-    if (!resource && !self->resource_provider)
-        return "no buffer was placed at the address and there is no resource provider";
-    if (!resource) resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
-    if (!resource || shape.va < start || shape.va - start >= size) {
-        if (resource) resource->Release();
-        return "no buffer holds the address";
+    if (!resource && self->resource_provider) {
+        resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
+        if (resource && (shape.va < start || shape.va - start >= size)) {
+            resource->Release();
+            resource = nullptr;
+        }
+    }
+    if (!resource) {
+        const char* why = nullptr;
+        resource = add_ref_title_page_buffer(self, shape.va, shape.resource.Width, &start, &size, why);
+        if (!resource) return why;
     }
     const std::uint64_t offset = shape.va - start;
     const std::uint64_t elements = std::min<std::uint64_t>(shape.resource.Width, size - offset) / element;
