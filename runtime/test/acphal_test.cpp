@@ -77,11 +77,18 @@ int main() {
     check(create(&acp) == S_OK && acp != nullptr,
           "AcpHalCreate returns S_OK with a non-null object");
     if (acp) {
-        // The returned object has a vtable: slots 0 (AddRef), 1 (Release), rest are E_NOTIMPL.
+        // The returned object has a vtable. Slots 0/1 are AddRef/Release; slot 2
+        // (SubmitCommand) and slot 5 (final Release) return S_OK because the title
+        // treats their failure as fatal at boot. Slots 3/4 return 0 (message poll),
+        // never called. Use a void(__stdcall*)(void) alias to call raw slots.
+        using SlotFn = HRESULT(__stdcall*)(void*);
         auto vtable = *static_cast<void* const* const*>(acp);
         check(vtable[0] != nullptr, "IAcpHal vtable slot 0 (AddRef) is present");
         check(vtable[1] != nullptr, "IAcpHal vtable slot 1 (Release) is present");
-        check(vtable[2] != nullptr, "IAcpHal vtable slot 2 (Connect/etc.) is present");
+        check(vtable[2] != nullptr, "IAcpHal vtable slot 2 (SubmitCommand) is present");
+        // Slot 2 must return S_OK, the title treats a failure as fatal.
+        check(reinterpret_cast<SlotFn>(vtable[2])(acp) == S_OK,
+              "IAcpHal slot 2 returns S_OK (title treats failure as fatal)");
     }
     check(create(nullptr) == E_POINTER,
           "AcpHalCreate(nullptr) returns E_POINTER");

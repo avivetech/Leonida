@@ -317,18 +317,39 @@ HRESULT __stdcall AcpHalReleaseShapeContexts(SHAPE_CONTEXTS* ctx) {
 
 // ---- IAcpHal vtable-backed interface (COM-like C++ class) ----
 //
-// The GDK documents five methods: Connect, Disconnect, GetNumMessages, PopMessage,
-// SubmitCommand. The title may call any of them through the returned interface pointer.
-// Return a minimal object whose vtable logs each slot once and returns E_NOTIMPL,
-// plus AddRef/Release that count nothing.
+// Measured call sites (PR #6885, 1.0.2.1):
+//   Slot 0: (0x1000, 0x1000) — Connect-style, result checked (fatal on failure)
+//   Slot 1: no arguments at shutdown — Release-style, result checked
+//   Slot 2: (cmd_id, dword*, dword, ptr*, dword) — command submit, result checked (fatal on failure)
+//   Slot 5: last call before object is set to NULL — Release-style final
+//   Slots 3 and 4: never called
+//
+// Return S_OK for slots 0 and 2 (the title treats failure of these as fatal at boot).
+// Slot 1 is Release (returns 1). Slot 5 returns S_OK (frees nothing, no-op).
+// Uncalled slots 3 and 4 return 0 (if they are a message poll, 0 = "no message").
+// All other slots log once and return E_NOTIMPL.
 
 constexpr size_t kAcpHalSlots = 8;
 
 ULONG __stdcall acphal_add_ref(void*) { return 1; }
 ULONG __stdcall acphal_release(void*) { return 1; }
 
+// Boot-critical: the title treats a failed slot 2 as fatal (int3).
+// Accept and drop the command.
+HRESULT __stdcall acphal_submit_command(void*) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] acphal: IAcpHal::SubmitCommand called; command dropped (no ACP hardware, logged once)\n");
+    }
+    return S_OK;
+}
+HRESULT __stdcall acphal_final_release(void*) { return S_OK; }
+// Slots 3 and 4 are never called. Return 0 (if they are a message poll, 0 = "no message").
+HRESULT __stdcall acphal_noop(void*) { return 0; }
+
 template <size_t Slot>
-HRESULT __stdcall acphal_slot(void*) {
+HRESULT __stdcall acphal_unsupported(void*) {
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
@@ -343,7 +364,11 @@ constexpr auto make_acphal_vtable(std::index_sequence<Slot...>) {
     return std::array<void*, sizeof...(Slot)>{
         (Slot == 0 ? reinterpret_cast<void*>(&acphal_add_ref)
          : Slot == 1 ? reinterpret_cast<void*>(&acphal_release)
-         : reinterpret_cast<void*>(&acphal_slot<Slot>))...};
+         : Slot == 2 ? reinterpret_cast<void*>(&acphal_submit_command)
+         : Slot == 3 ? reinterpret_cast<void*>(&acphal_noop)
+         : Slot == 4 ? reinterpret_cast<void*>(&acphal_noop)
+         : Slot == 5 ? reinterpret_cast<void*>(&acphal_final_release)
+         : reinterpret_cast<void*>(&acphal_unsupported<Slot>))...};
 }
 
 const auto kAcpHalVtable = make_acphal_vtable(std::make_index_sequence<kAcpHalSlots>{});
