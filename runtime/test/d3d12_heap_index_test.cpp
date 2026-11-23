@@ -498,6 +498,213 @@ int run_graphics(vktest::Device& d, const std::filesystem::path& root_dir, unsig
     return 0;
 }
 
+// Part 3, the sampler heap: a signature of one root constant with both heap flags on a graphics PSO of vs_m2.asm and
+// ps_sampler_heap.asm, which samples the T# at resource heap slot 0 (a 2x1 texture, texel 0 red, texel 1 green) at
+// u = 1.25 with the S# at sampler heap index k, found at k * 16 as in the game's shaders. Sampler slot 1 is CLAMP
+// (green), slots 0 and 2 WRAP (red), so each draw shows which slot it read. With 32-byte sampler slots, index 1 would
+// read the empty upper half of slot 0 and index 2 slot 1: the k = 1 and k = 2 draws are the negative control.
+int run_samplers(vktest::Device& d, const std::filesystem::path& root_dir, unsigned& texels_checked) {
+    leonida::ShaderLibrary library;
+    EXPECT(library.load((root_dir / "spirv").string()));
+    const auto vs_program = read_file(root_dir / "fssm" / "vs_m2.fssm");
+    const auto ps_program = read_file(root_dir / "fssm" / "ps_sampler_heap.fssm");
+    EXPECT(library.find("vs", leonida::sha256_hex(vs_program)) && library.find("ps", leonida::sha256_hex(ps_program)));
+    const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
+    Ref<ID3D12Device> device;
+    EXPECT(create_device(d, root_dir, device));
+    const auto root_blob = root_signature(res | smp);
+    Ref<ID3D12RootSignature> root;
+    EXPECT(!root_blob.empty() &&
+           SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
+    // The samplers are placed with the device's increment, as a title places them; the shader steps 16 bytes.
+    const UINT sampler_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+    constexpr UINT size = 4;
+    constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.p;
+    pso_desc.VS = {vs_container.data(), vs_container.size()};
+    pso_desc.PS = {ps_container.data(), ps_container.size()};
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso_desc.SampleMask = 0xffffffff;
+    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso_desc.RasterizerState.DepthClipEnable = TRUE;
+    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = format;
+    pso_desc.SampleDesc.Count = 1;
+    Ref<ID3D12PipelineState> pso;
+    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+
+    constexpr std::uint32_t red = 0xff0000ffu, green = 0xff00ff00u;  // R8G8B8A8 as a little-endian word
+    constexpr std::uint16_t indices[6] = {0, 1, 2, 2, 1, 3};
+    constexpr UINT64 index_offset = 256, pitch = 256, slice = pitch * size;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, upload_heap{D3D12_HEAP_TYPE_UPLOAD},
+        readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> upload, readback, texture, target;
+    {
+        const auto desc = buffer_desc(512);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&upload.p))));
+        const auto back = buffer_desc(slice * 3);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &back,
+                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                         IID_PPV_ARGS(&readback.p))));
+        std::uint8_t* mapped = nullptr;
+        EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+        const std::uint32_t texels[2] = {red, green};
+        std::memcpy(mapped, texels, sizeof(texels));
+        std::memcpy(mapped + index_offset, indices, sizeof(indices));
+        upload->Unmap(0, nullptr);
+    }
+    D3D12_RESOURCE_DESC texture_desc{};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = 2;
+    texture_desc.Height = 1;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = format;
+    texture_desc.SampleDesc.Count = 1;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&texture.p))));
+    D3D12_RESOURCE_DESC target_desc = texture_desc;
+    target_desc.Width = size;
+    target_desc.Height = size;
+    target_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &target_desc,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&target.p))));
+
+    const D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC sampler_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    Ref<ID3D12DescriptorHeap> views, samplers, staging, rtv_heap;
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&views.p))));
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&samplers.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC staging_desc = sampler_desc;
+    staging_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging.p))));
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap.p))));
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(target.p, nullptr, rtv);
+    device->CreateShaderResourceView(texture.p, nullptr, views->GetCPUDescriptorHandleForHeapStart());
+    // The samplers are made in a non-shader-visible heap and copied, as titles stage them: CopyDescriptorsSimple
+    // walks 16-byte slots too. Slot 1 is written last, so an overlapping write would show.
+    const auto sampler = [&](UINT index, D3D12_TEXTURE_ADDRESS_MODE u) {
+        D3D12_SAMPLER_DESC s{};
+        s.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        s.AddressU = u;
+        s.AddressV = s.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        s.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_CPU_DESCRIPTOR_HANDLE at = staging->GetCPUDescriptorHandleForHeapStart();
+        at.ptr += SIZE_T(index) * sampler_step;
+        device->CreateSampler(&s, at);
+    };
+    sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+    sampler(2, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+    sampler(1, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    device->CopyDescriptorsSimple(3, samplers->GetCPUDescriptorHandleForHeapStart(),
+                                  staging->GetCPUDescriptorHandleForHeapStart(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = texture.p;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = upload.p;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = {0, {format, 2, 1, 1, UINT(pitch)}};
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b = transition(texture.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &b);
+    }
+    ID3D12DescriptorHeap* heaps[] = {views.p, samplers.p};
+    list->SetDescriptorHeaps(2, heaps);
+    list->SetGraphicsRootSignature(root.p);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_INDEX_BUFFER_VIEW ibv{upload->GetGPUVirtualAddress() + index_offset, sizeof(indices),
+                                      DXGI_FORMAT_R16_UINT};
+    list->IASetIndexBuffer(&ibv);
+    const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
+    const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const FLOAT clear[4] = {0.0f, 0.0f, 1.0f, 1.0f};  // blue: a pixel the draw missed shows
+    for (UINT k = 0; k < 3; ++k) {
+        list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        list->SetGraphicsRoot32BitConstant(0, k, 0);
+        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        D3D12_RESOURCE_BARRIER b = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                              D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &b);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = readback.p;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = {slice * k, {format, size, size, 1, UINT(pitch)}};
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = target.p;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        list->ResourceBarrier(1, &b);
+    }
+    EXPECT(list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(event != nullptr);
+    EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, event)));
+    if (WaitForSingleObject(event, 20000) != WAIT_OBJECT_0) {
+        std::fprintf(stderr, "the fence never reached 1\n");
+        return 1;
+    }
+    CloseHandle(event);
+
+    std::vector<std::uint8_t> got(slice * 3);
+    {
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        std::memcpy(got.data(), mapped, got.size());
+        readback->Unmap(0, nullptr);
+    }
+    const std::uint32_t want[3] = {red, green, red};
+    unsigned bad = 0;
+    for (UINT k = 0; k < 3; ++k)
+        for (UINT y = 0; y < size; ++y)
+            for (UINT x = 0; x < size; ++x) {
+                std::uint32_t texel = 0;
+                std::memcpy(&texel, got.data() + slice * k + pitch * y + 4 * x, sizeof(texel));
+                ++texels_checked;
+                if (texel != want[k] && bad++ < 8)
+                    std::fprintf(stderr, "sampler heap index %u pixel (%u, %u): 0x%08x, expected 0x%08x\n", k, x, y,
+                                 texel, want[k]);
+            }
+    EXPECT(bad == 0);
+    EXPECT(sampler_step == 16);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -509,12 +716,19 @@ int main() {
     if (const int status = run(d, LEONIDA_TEST_HEAP_INDEX_DIR, words)) return status;
     unsigned texels = 0;
     if (const int status = run_graphics(d, LEONIDA_TEST_HEAP_INDEX_DIR, texels)) return status;
+    unsigned sampled = 0;
+    if (d.bindless) {
+        if (const int status = run_samplers(d, LEONIDA_TEST_HEAP_INDEX_DIR, sampled)) return status;
+    } else {
+        std::printf("part 3 skipped: the device lacks the descriptor indexing features of the bindless set 0\n");
+    }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("d3d12_heap_index: %u words match through heap-indexed V#s (two heaps, run-time and static slots, "
-                "Dispatch and ExecuteIndirect), and %u texels drawn through them by a pixel shader\n",
-                words, texels);
+                "Dispatch and ExecuteIndirect), %u texels drawn through them by a pixel shader, and %u texels "
+                "sampled through heap-indexed samplers\n",
+                words, texels, sampled);
     return 0;
 }

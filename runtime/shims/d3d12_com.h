@@ -414,8 +414,15 @@ IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP
 bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS& cbv_srv_uav,
                                  D3D12_GPU_VIRTUAL_ADDRESS& sampler);
 
-// The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
+// The size of a descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges. CBV/SRV/UAV slots hold a T# (32
+// bytes), RTV and DSV slots a TargetView. A sampler slot holds one S#, 16 bytes: the console steps a sampler heap by
+// 16 (the game's shaders index the sampler heap with index << 4, and every static offset of an S# load is a multiple
+// of 16; docs/d3d12_vulkan.md section 3.4), so a heap-indexed or table-relative sampler is found at index * 16.
 inline constexpr UINT descriptor_size = 32;
+inline constexpr UINT sampler_descriptor_size = 16;
+inline constexpr UINT descriptor_slot_size(D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    return type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_descriptor_size : descriptor_size;
+}
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);

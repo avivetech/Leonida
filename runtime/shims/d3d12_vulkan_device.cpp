@@ -66,8 +66,9 @@
 namespace rt::d3d12 {
 namespace {
 
-// Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
-// increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
+// Every CBV/SRV/UAV, RTV and DSV slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. A sampler
+// slot is sampler_descriptor_size (16), the console's step (d3d12_com.h). The application reads the increments from
+// the device, as it must (open question 4 in docs/d3d12_vulkan.md).
 constexpr UINT kDescriptorSize = descriptor_size;
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
@@ -76,6 +77,7 @@ constexpr std::uint32_t kQuadIndicesPerQuad = leonida::quad_triangle_indices.siz
 constexpr std::uint32_t kQuadIndexCount = 16 * 1024 * kQuadIndicesPerQuad;
 constexpr VkDeviceSize kArenaReserved = kZeroPage + VkDeviceSize(kQuadIndexCount) * sizeof(std::uint32_t);
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
+static_assert(sizeof(leonida::gfx10::SamplerWords) == sampler_descriptor_size);  // an S# is the whole sampler slot
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
 // game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
@@ -1999,7 +2001,7 @@ public:
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
+        const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * descriptor_slot_size(desc.Type);
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
@@ -2024,8 +2026,9 @@ public:
             std::lock_guard lock(device_.cbv_heap_mutex);
             device_.cbv_heaps.erase(arena_offset_);
         }
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
-                                            DeviceState::arena_descriptor_heap);
+        if (in_arena_)
+            device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * descriptor_slot_size(desc_.Type),
+                                  DeviceState::arena_descriptor_heap);
     }
 
     bool ok() const { return cpu_ != nullptr; }
@@ -6755,8 +6758,8 @@ public:
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
-    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        return kDescriptorSize;
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        return descriptor_slot_size(type);
     }
 
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -6926,8 +6929,9 @@ public:
     void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
                                            const UINT* destination_sizes, UINT source_ranges,
                                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
-                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type) override {
         if (!destinations || !sources) return;
+        const std::size_t slot = descriptor_slot_size(type);
         UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
         while (d < destination_ranges && s < source_ranges) {
             if (d_at >= (destination_sizes ? destination_sizes[d] : 1) || !destinations[d].ptr) {
@@ -6937,19 +6941,18 @@ public:
                 ++s;
                 s_at = 0;
             } else {
-                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
-                             kDescriptorSize);
+                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * slot,
+                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * slot, slot);
             }
         }
     }
 
     void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
                                                  D3D12_CPU_DESCRIPTOR_HANDLE source,
-                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE type) override {
         if (!destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
-                     std::size_t(count) * kDescriptorSize);
+                     std::size_t(count) * descriptor_slot_size(type));
     }
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
@@ -7327,12 +7330,12 @@ public:
         state_.context->note_shader_image(r->id());
     }
 
-    // A sampler is an S# in the first 16 bytes of the slot; the shader finds the sampler by those four dwords.
+    // A sampler is an S#, the whole 16-byte slot; the shader finds the sampler by those four dwords.
     void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* desc,
                                          D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateSampler");
         if (!destination.ptr) return;
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, sampler_descriptor_size);
         if (!desc) return;
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -7352,7 +7355,7 @@ public:
             return;
         }
         const leonida::gfx10::SamplerWords words = sampler2_words(*desc);
-        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, sampler_descriptor_size);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         state_.bind_sampler(words);
     }
