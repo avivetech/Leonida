@@ -36,6 +36,7 @@
 #ifdef LEONIDA_VULKAN_DEVICE
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
+#include "title_window.h"
 #include "xbox_present.h"
 #endif
 
@@ -1518,9 +1519,10 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        if (owns_window && window) DestroyWindow(window);  // only destroy the fallback window we created
     }
     HWND window = nullptr;
+    bool owns_window = false;
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1541,28 +1543,36 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
+    state->window = rt::d3d12::find_title_window(GetCurrentProcessId());
+    if (state->window) {
+        state->owns_window = false;
+    } else {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                      CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720, nullptr, nullptr,
+                                      window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->owns_window = true;
+        ShowWindow(state->window, SW_SHOW);
     }
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
-    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
+    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
+    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (%s window %p)\n",
+                 state->owns_window ? "fallback" : "title", static_cast<void*>(state->window));
     return state;
 }
 
@@ -1570,10 +1580,51 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
-        static_cast<UINT>(plane_count),
-        reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+    const auto* plane_arr = reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes);
+    const auto* present_params = reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params);
+    if (plane_count > 0 && plane_arr && self->device->frame_tokens) {
+        const std::uint64_t tok = plane_arr[0].Token;
+        std::uint64_t issued = self->device->frame_tokens->issued();
+        if (tok > issued && tok - issued <= 1024) {
+            while (self->device->frame_tokens->issued() < tok) {
+                (void)self->device->frame_tokens->issue();
+            }
+        }
+    }
+    const HRESULT hr = state->xbox->PresentX(static_cast<UINT>(plane_count), plane_arr, present_params);
+    static std::atomic<std::uint64_t> present_calls{0};
+    static std::atomic<std::uint64_t> present_ok{0};
+    static std::atomic<std::uint64_t> present_fail{0};
+    const std::uint64_t n = present_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (SUCCEEDED(hr)) {
+        const std::uint64_t ok = present_ok.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ok == 1 || ok == 10 || ok == 100 || ok == 1000 || ok == 5000) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: PresentX #%llu ok (total ok=%llu fail=%llu planes=%u tok=%llu res_cnt=%u res0=%p cs=%u flags=0x%x)\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(ok),
+                         static_cast<unsigned long long>(present_fail.load(std::memory_order_relaxed)),
+                         static_cast<unsigned>(plane_count),
+                         plane_arr && plane_count ? static_cast<unsigned long long>(plane_arr[0].Token) : 0ull,
+                         plane_arr && plane_count ? plane_arr[0].ResourceCount : 0u,
+                         plane_arr && plane_count && plane_arr[0].ppResources ? static_cast<void*>(plane_arr[0].ppResources[0]) : nullptr,
+                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u,
+                         present_params ? present_params->Flags : 0u);
+        }
+    } else {
+        const std::uint64_t fail = present_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (fail <= 5) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: PresentX #%llu FAILED hr=0x%08x (planes=%u tok=%llu res_cnt=%u res0=%p cs=%u flags=0x%x)\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned>(hr),
+                         static_cast<unsigned>(plane_count),
+                         plane_arr && plane_count ? static_cast<unsigned long long>(plane_arr[0].Token) : 0ull,
+                         plane_arr && plane_count ? plane_arr[0].ResourceCount : 0u,
+                         plane_arr && plane_count && plane_arr[0].ppResources ? static_cast<void*>(plane_arr[0].ppResources[0]) : nullptr,
+                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u,
+                         present_params ? present_params->Flags : 0u);
+        }
+    }
+    return hr_to_u64(hr);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)

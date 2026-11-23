@@ -3411,8 +3411,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
             if (ok && d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
+                log_once("depth-bounds tests not emulated yet (ignored); stream subobject", int(type));
             }
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
@@ -3423,8 +3422,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             take(d);
             if (!ok) break;
             if (d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
+                log_once("depth-bounds tests not emulated yet (ignored); stream subobject", int(type));
             }
             // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
             if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
@@ -3592,6 +3590,11 @@ public:
     static bool stub_pipelines() {
         wchar_t v[8] = {};
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
+        return n > 0 && n < 8 && v[0] != L'0';
+    }
+    static bool lazy_pipelines() {
+        wchar_t v[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_LAZY_PIPELINES", v, 8);
         return n > 0 && n < 8 && v[0] != L'0';
     }
     HRESULT stub_or(HRESULT hr, const char* what) {
@@ -4175,8 +4178,10 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
-        graphics_.pipeline = build(0);
-        if (!graphics_.pipeline) return E_FAIL;
+        if (!lazy_pipelines()) {
+            graphics_.pipeline = build(0);
+            if (!graphics_.pipeline) return E_FAIL;
+        }
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
         if (code_stage) {
@@ -4428,6 +4433,11 @@ private:
             return VK_NULL_HANDLE;
         }
         variants_.emplace(unbound, pipeline);
+        static std::atomic<unsigned> built{0};
+        const unsigned n = ++built;
+        if (n <= 16 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: lazily compiled graphics pipeline #%u (unbound=0x%x, stages=%zu)\n",
+                         n, unbound, recipe_.stages.size());
         return pipeline;
     }
 
@@ -9135,6 +9145,11 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+bool is_stub_pipeline(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && !p->compute() && !p->graphics();
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
