@@ -2418,6 +2418,15 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
+      # The console's rectangle and quad lists (src/rect_list_geometry.h), through the same translated vs_m15 / ps_m15.
+      add_executable(d3d12_rect_list_test test/d3d12_rect_list_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M15_FILES})
+      target_link_libraries(d3d12_rect_list_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_rect_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
+      target_compile_options(d3d12_rect_list_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_rect_list COMMAND d3d12_rect_list_test)
+      set_tests_properties(d3d12_rect_list PROPERTIES SKIP_RETURN_CODE 77)
+
       # vk_bindless_test (the bindless set and its table at the Vulkan level, no D3D12) takes the translated vs_ids,
       # ps_tex and ps_imgatomic; it was only run by scripts/run_gpu_tests.py and check.py until D3D-314 needed it.
       set(LEONIDA_BINDLESS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/bindless_shaders)

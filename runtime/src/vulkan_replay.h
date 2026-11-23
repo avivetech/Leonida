@@ -32,6 +32,7 @@
 
 #include "command_list.h"
 #include "depth24.h"
+#include "rect_list_geometry.h"
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
@@ -870,6 +871,10 @@ struct ReplayFunctions {
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
+    // 0, 1, 2, ... as 32-bit indices: what a non-indexed quad list is drawn with (quad_index_count of them).
+    VkBuffer quad_indices = VK_NULL_HANDLE;
+    VkDeviceSize quad_indices_offset = 0;
+    std::uint32_t quad_index_count = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -2183,6 +2188,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
+    // A non-indexed quad list is drawn from the shared 0, 1, 2, ... index buffer (emit).
+    if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
+        return ReplayResult::unresolved_resource;
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
@@ -2217,6 +2225,11 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    // The console's lists (rect_list_geometry.h). A rectangle list is drawn as the triangle list of its three
+    // corners, the pipeline's geometry stage adds the fourth. A quad (v0 v1 v2 v3) is the fan (v0 v1 v2) (v0 v2 v3),
+    // which is the index pattern 0 1 2, 0 2 3; the draw below issues one fan per quad.
+    case topology_rect_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case topology_quad_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
 }
@@ -4113,6 +4126,22 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->topology == topology_quad_list) {
+                // One four-vertex fan per quad. The translated vertex shaders take their vertex id from the index
+                // value (VertexIndex - BaseVertex), so a fan must be drawn with the index values 4q..4q+3: an
+                // indexed draw reads them from the application's index buffer, a non-indexed one from the
+                // shared 0, 1, 2, ... buffer (quad_indices), with the draw's first vertex as the vertex offset, as
+                // VertexIndex is first + i for a plain draw.
+                const bool generated = !draw->indexed;  // prepare() has checked that quad_indices is there
+                if (generated)
+                    vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
+                else
+                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                const std::uint32_t quads = std::min(draw->count / 4, generated ? vk.quad_index_count / 4 : UINT32_MAX);
+                const std::int32_t vertex_offset = generated ? std::int32_t(draw->first) : draw->base_vertex;
+                for (std::uint32_t quad = 0; quad < quads; ++quad)
+                    vk.draw_indexed(command_buffer, 4, draw->instances, (generated ? 0 : draw->first) + 4 * quad,
+                                    vertex_offset, draw->first_instance);
             } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
