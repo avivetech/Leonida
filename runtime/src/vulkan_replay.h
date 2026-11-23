@@ -755,6 +755,7 @@ struct ComputePipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
+    std::function<VkPipeline()> resolve;            // lazy compute pipeline builder when LEONIDA_LAZY_PIPELINES=1
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -3045,9 +3046,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                if (!pipeline || (!pipeline->pipeline && !pipeline->resolve)) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+                if (!p.pipeline.pipeline) {
+                    p.pipeline.pipeline = pipeline->resolve();
+                    if (!p.pipeline.pipeline) return ReplayResult::unsupported;
+                }
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3094,9 +3099,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+            if (!pipeline || (!pipeline->pipeline && !pipeline->resolve)) return ReplayResult::unresolved_resource;
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            if (!p.pipeline.pipeline) {
+                p.pipeline.pipeline = pipeline->resolve();
+                if (!p.pipeline.pipeline) return ReplayResult::unsupported;
+            }
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];

@@ -3523,6 +3523,7 @@ public:
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
+        if (lazy_compute_) vk.vkDestroyPipeline(dev, lazy_compute_, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) device_.shader_modules().release(module_);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
@@ -4298,23 +4299,29 @@ public:
             pipeline_.bindless_set = device_.bindless->set();
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module_;
-        pipeline_info.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
-        subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        pipeline_info.layout = pipeline_.layout;
-        VkResult created = VK_ERROR_UNKNOWN;
-        {
-            // The console makes this pipeline from native code at once; the driver's compile of the translated module
-            // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
-            const rt::host_stall::Scope compiling;
-            created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
-                                                  &pipeline_.pipeline);
+        compute_stage_ = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        compute_stage_.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        compute_stage_.module = module_;
+        compute_stage_.pName = "main";
+        compute_required_size_ = {};
+        subgroup_size_for(*entry, compute_required_size_, compute_stage_);
+        compute_has_required_size_ = (compute_stage_.pNext != nullptr);
+        compute_stage_.pNext = nullptr;
+        if (lazy_pipelines()) {
+            pipeline_.resolve = [this]() { return resolve_compute(); };
+        } else {
+            VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipeline_info.stage = compute_stage_;
+            if (compute_has_required_size_) pipeline_info.stage.pNext = &compute_required_size_;
+            pipeline_info.layout = pipeline_.layout;
+            VkResult created = VK_ERROR_UNKNOWN;
+            {
+                const rt::host_stall::Scope compiling;
+                created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                                      &pipeline_.pipeline);
+            }
+            if (created != VK_SUCCESS) return E_FAIL;
         }
-        if (created != VK_SUCCESS) return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4454,8 +4461,34 @@ private:
         return pipeline;
     }
 
+    VkPipeline resolve_compute() {
+        std::lock_guard lock(variants_mutex_);
+        if (lazy_compute_) return lazy_compute_;
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = compute_stage_;
+        if (compute_has_required_size_) pipeline_info.stage.pNext = &compute_required_size_;
+        pipeline_info.layout = pipeline_.layout;
+        VkPipeline built = VK_NULL_HANDLE;
+        {
+            const rt::host_stall::Scope compiling;
+            if (device_.context->vk.vkCreateComputePipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                             &pipeline_info, nullptr, &built) != VK_SUCCESS)
+                return VK_NULL_HANDLE;
+        }
+        lazy_compute_ = built;
+        static std::atomic<unsigned> built_n{0};
+        const unsigned n = ++built_n;
+        if (n <= 16 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: lazily compiled compute pipeline #%u\n", n);
+        return lazy_compute_;
+    }
+
     DeviceState& device_;
     leonida::ComputePipeline pipeline_;
+    VkPipeline lazy_compute_ = VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo compute_stage_{};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo compute_required_size_{};
+    bool compute_has_required_size_ = false;
     leonida::GraphicsPipeline graphics_;
     Recipe recipe_;
     std::mutex variants_mutex_;
