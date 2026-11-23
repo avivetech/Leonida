@@ -1,14 +1,15 @@
 // Direct heap indexing in compute (docs/d3d12_vulkan.md sections 3.4 and 3.5): a root signature with
 // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED makes the list write the bound CBV/SRV/UAV heap's base, the heap SetDescriptorHeaps
-// bound, into the user SGPR right after the root arguments at each Dispatch. The shader is translator output
-// (test/shaders/cs_heap_index.asm, hand-written RDNA2 in the shape of the game's heap-indexing shaders): it loads the
-// V# at heap slot k (k a root constant, a run-time offset) and at heap slot 1 (a static offset) from that base and
-// writes through both.
+// bound, into the user SGPR right after the root arguments at each Dispatch and dispatch ExecuteIndirect. The shader is
+// translator output (test/shaders/cs_heap_index.asm, hand-written RDNA2 in the shape of the game's heap-indexing
+// shaders): it loads the V# at heap slot k (k a root constant, a run-time offset) and at heap slot 1 (a static offset)
+// from that base and writes through both.
 //
-// One list, three dispatches, each of one 64-lane group:
-//   1. heap A bound, k = 2: A[2] is buffer a2, A[1] buffer a1
-//   2. heap B bound, k = 2: B[2] is buffer b2, B[1] buffer b1
-//   3. heap A bound, k = 3: A[3] is buffer a3, A[1] buffer a1 again
+// One list, four dispatches, each of one 64-lane group:
+//   1. Dispatch, heap A bound, k = 2: A[2] is buffer a2, A[1] buffer a1
+//   2. Dispatch, heap B bound, k = 2: B[2] is buffer b2, B[1] buffer b1
+//   3. Dispatch, heap A bound, k = 3: A[3] is buffer a3, A[1] buffer a1 again
+//   4. ExecuteIndirect of one DISPATCH (1, 1, 1), heap B bound, k = 3: B[3] is buffer b3, B[1] buffer b1 again
 // Every buffer starts as a sentinel and is compared word by word with the CPU reference. Negative control: dispatch 2
 // differs from dispatch 1 only in the heap SetDescriptorHeaps bound, so its writes land in heap B's buffers only if
 // the base the shader reads follows the binding; a base left at 0 or at the first heap would leave b2 and b1 at the
@@ -49,7 +50,7 @@ constexpr UINT lanes = 64;
 constexpr UINT64 bytes = lanes * 4;
 constexpr std::uint32_t sentinel = 0x5e5e5e5eu;
 
-enum Buf { a1, a2, a3, b1, b2, buffer_count };
+enum Buf { a1, a2, a3, b1, b2, b3, buffer_count };
 
 // A root signature of one 32-bit constant with `flags`. The host serializer is given no flags (Windows 10's refuses
 // the heap-indexing ones) and the flags word of the RTS0 1.0 header, its sixth dword, is written afterwards.
@@ -177,6 +178,21 @@ int run(vktest::Device& d, const std::filesystem::path& root_dir, unsigned& word
     raw_view(heap_a.p, 3, a3);
     raw_view(heap_b.p, 1, b1);
     raw_view(heap_b.p, 2, b2);
+    raw_view(heap_b.p, 3, b3);
+
+    // The indirect arguments: one D3D12_DISPATCH_ARGUMENTS of (1, 1, 1), read from an upload buffer.
+    const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
+    Ref<ID3D12CommandSignature> command_signature;
+    EXPECT(SUCCEEDED(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&command_signature.p))));
+    Ref<ID3D12Resource> arguments;
+    EXPECT(create(arguments, upload_heap, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ));
+    {
+        D3D12_DISPATCH_ARGUMENTS* mapped = nullptr;
+        EXPECT(SUCCEEDED(arguments->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+        *mapped = {1, 1, 1};
+        arguments->Unmap(0, nullptr);
+    }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -197,17 +213,21 @@ int run(vktest::Device& d, const std::filesystem::path& root_dir, unsigned& word
     list->ResourceBarrier(buffer_count, barriers);
     list->SetComputeRootSignature(root.p);
     list->SetPipelineState(pso.p);
-    const auto dispatch = [&](ID3D12DescriptorHeap* h, UINT k) {
+    const auto dispatch = [&](ID3D12DescriptorHeap* h, UINT k, bool indirect) {
         list->SetDescriptorHeaps(1, &h);
         list->SetComputeRoot32BitConstant(0, k, 0);
-        list->Dispatch(1, 1, 1);
+        if (indirect)
+            list->ExecuteIndirect(command_signature.p, 1, arguments.p, 0, nullptr, 0);
+        else
+            list->Dispatch(1, 1, 1);
         D3D12_RESOURCE_BARRIER all{};
-        all.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // a1 is written twice
+        all.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // a1 and b1 are written twice
         list->ResourceBarrier(1, &all);
     };
-    dispatch(heap_a.p, 2);
-    dispatch(heap_b.p, 2);
-    dispatch(heap_a.p, 3);
+    dispatch(heap_a.p, 2, false);
+    dispatch(heap_b.p, 2, false);
+    dispatch(heap_a.p, 3, false);
+    dispatch(heap_b.p, 3, true);
     for (int i = 0; i < buffer_count; ++i) barriers[i] = transition(buf[i].p, uav_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->ResourceBarrier(buffer_count, barriers);
     for (int i = 0; i < buffer_count; ++i) list->CopyBufferRegion(readback.p, bytes * i, buf[i].p, 0, bytes);
@@ -232,7 +252,8 @@ int run(vktest::Device& d, const std::filesystem::path& root_dir, unsigned& word
         std::memcpy(got.data(), mapped, got.size() * 4);
         readback->Unmap(0, nullptr);
     }
-    // a1 and b1: the static slot; a2, b2: k = 2 through heaps A and B; a3: k = 3 through heap A.
+    // a1 and b1: the static slot; a2, b2: k = 2 through heaps A and B; a3, b3: k = 3 through heap A (Dispatch) and
+    // heap B (ExecuteIndirect).
     const auto want = [](Buf which, UINT g) -> std::uint32_t {
         switch (which) {
             case a1:
@@ -242,12 +263,13 @@ int run(vktest::Device& d, const std::filesystem::path& root_dir, unsigned& word
             case b2:
                 return 0x2000u + g;
             case a3:
+            case b3:
                 return 0x3000u + g;
             default:
                 return sentinel;
         }
     };
-    static const char* const names[buffer_count] = {"A[1]", "A[2]", "A[3]", "B[1]", "B[2]"};
+    static const char* const names[buffer_count] = {"A[1]", "A[2]", "A[3]", "B[1]", "B[2]", "B[3]"};
     unsigned bad = 0;
     for (int i = 0; i < buffer_count; ++i)
         for (UINT g = 0; g < lanes; ++g) {
@@ -273,7 +295,8 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("d3d12_heap_index: %u words match through heap-indexed V#s (two heaps, run-time and static slots)\n",
+    std::printf("d3d12_heap_index: %u words match through heap-indexed V#s (two heaps, run-time and static slots, "
+                "Dispatch and ExecuteIndirect)\n",
                 words);
     return 0;
 }
