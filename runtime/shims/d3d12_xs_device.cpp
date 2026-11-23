@@ -1523,9 +1523,58 @@ struct PresentState {
     }
     HWND window = nullptr;
     bool owns_window = false;
+    rt::d3d12::WindowPresenter* presenter = nullptr;  // non-owning; owned by xbox
+    bool capture_enabled = false;
+    std::string dump_prefix;
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
+
+void dump_present_frame(PresentState* state, std::uint64_t frame_num) {
+    if (!state || !state->capture_enabled || !state->presenter) return;
+    std::vector<std::uint8_t> pixels;
+    VkExtent2D ext{};
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    if (!state->presenter->read_back(pixels, &ext, &fmt) || !ext.width || !ext.height) return;
+    const bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    const std::size_t n_px = std::size_t(ext.width) * ext.height;
+    std::size_t nonblack = 0;
+    unsigned max_r = 0, max_g = 0, max_b = 0;
+    for (std::size_t i = 0; i < n_px; ++i) {
+        const unsigned c0 = pixels[i * 4 + 0];
+        const unsigned c1 = pixels[i * 4 + 1];
+        const unsigned c2 = pixels[i * 4 + 2];
+        const unsigned r = bgra ? c2 : c0;
+        const unsigned g = c1;
+        const unsigned b = bgra ? c0 : c2;
+        if (r || g || b) ++nonblack;
+        if (r > max_r) max_r = r;
+        if (g > max_g) max_g = g;
+        if (b > max_b) max_b = b;
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: frame #%llu (%ux%u fmt=%d): nonblack=%zu/%zu maxRGB=(%u,%u,%u)\n",
+                 static_cast<unsigned long long>(frame_num), ext.width, ext.height, static_cast<int>(fmt),
+                 nonblack, n_px, max_r, max_g, max_b);
+    static std::atomic<bool> dumped_nonblack{false};
+    const bool save = (frame_num == 10) || (nonblack > 0 && !dumped_nonblack.exchange(true, std::memory_order_relaxed)) ||
+                      (nonblack > 0 && frame_num % 1000 == 0);
+    if (!save || state->dump_prefix.empty()) return;
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s_%llu.ppm", state->dump_prefix.c_str(),
+                  static_cast<unsigned long long>(frame_num));
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fprintf(f, "P6\n%u %u\n255\n", ext.width, ext.height);
+        std::vector<std::uint8_t> rgb(n_px * 3);
+        for (std::size_t i = 0; i < n_px; ++i) {
+            rgb[i * 3 + 0] = pixels[i * 4 + (bgra ? 2 : 0)];
+            rgb[i * 3 + 1] = pixels[i * 4 + 1];
+            rgb[i * 3 + 2] = pixels[i * 4 + (bgra ? 0 : 2)];
+        }
+        std::fwrite(rgb.data(), 1, rgb.size(), f);
+        std::fclose(f);
+        std::fprintf(stderr, "[rt] d3d12_xs: saved frame to %s\n", path);
+    }
+}
 
 void destroy_present_state(void* present_state) {
     delete static_cast<PresentState*>(present_state);
@@ -1570,6 +1619,17 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
         return state;
     }
+    {
+        char dump_buf[512] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_PRESENT_DUMP", dump_buf, sizeof(dump_buf));
+        if (n > 0 && n < sizeof(dump_buf)) {
+            state->dump_prefix = dump_buf;
+            state->capture_enabled = presenter->enable_capture();
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX capture %s (prefix %s)\n",
+                         state->capture_enabled ? "enabled" : "FAILED", state->dump_prefix.c_str());
+        }
+    }
+    state->presenter = presenter.get();
     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (%s window %p)\n",
                  state->owns_window ? "fallback" : "title", static_cast<void*>(state->window));
@@ -1608,6 +1668,10 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                          plane_arr && plane_count ? plane_arr[0].ResourceCount : 0u,
                          plane_arr && plane_count && plane_arr[0].ppResources ? static_cast<void*>(plane_arr[0].ppResources[0]) : nullptr,
                          plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u);
+        }
+        if (state->capture_enabled &&
+            (ok == 1 || ok == 10 || ok == 50 || ok == 100 || ok == 250 || (ok % 500 == 0))) {
+            dump_present_frame(state, ok);
         }
     } else {
         const std::uint64_t fail = present_fail.fetch_add(1, std::memory_order_relaxed) + 1;
