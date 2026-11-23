@@ -3508,6 +3508,7 @@ struct XmemBackingOwner final : IUnknown {
 // The handler slot 133 uses to make a buffer on the title's own pages (set_placed_at_va_handler). Committed buffers
 // whose memory comes from the title's XMem hook are made on that memory through the same handler.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+PlacedAtVaHandler placed_at_va_handler() { return g_placed_at_va.load(std::memory_order_acquire); }
 
 struct XmemHooks {
     DescriptorHeapBackingAlloc alloc = nullptr;
