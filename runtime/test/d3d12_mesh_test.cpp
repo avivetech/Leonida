@@ -50,6 +50,9 @@ using PsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHAD
 using CsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE>;
 using AsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE>;
 using MsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE>;
+// The console's VS and HS in streams without MS: subobject types 24 and 23, which the PC runtime does not define.
+using ConsoleVsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>;
+using ConsoleHsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), D3D12_SHADER_BYTECODE>;
 using TopologySubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE>;
 using TargetsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
 using DepthStencil1Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1>;
@@ -190,6 +193,37 @@ int main() {
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
+    // Console streams without a mesh subobject (slot 86; TreXito's static reading of the retail title, Leonida#8186):
+    // the VS is subobject 24 and the HS is 23. Without MS, 24 is the VS and 23 the HS, and the HS is not built yet, so
+    // a stream with it is E_NOTIMPL. No mesh extension needed.
+    {
+        Ref<ID3D12Device> device;
+        Ref<ID3D12RootSignature> root;
+        EXPECT(make_device(false, device));
+        EXPECT(root_signature(device.p, root));
+        Stream console;
+        console.add(RootSubobject{.inner = root.p}).add(ConsoleVsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+        console.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
+        console.add(TargetsSubobject{.inner = one_target()});
+        Ref<ID3D12PipelineState> console_pso;
+        EXPECT(SUCCEEDED(create(device.p, console, console_pso)) && console_pso.p);
+
+        Stream with_hs = console;
+        with_hs.add(ConsoleHsSubobject{.inner = ps});
+        Ref<ID3D12PipelineState> refused;
+        EXPECT(create(device.p, with_hs, refused) == E_NOTIMPL && !refused.p);
+
+        Stream hs_only;
+        hs_only.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs});
+        hs_only.add(ConsoleHsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+        hs_only.add(TargetsSubobject{.inner = one_target()});
+        EXPECT(create(device.p, hs_only, refused) == E_NOTIMPL && !refused.p);
+
+        // With a real VS, 24 is not remapped: it stays an amplification shader, which is refused.
+        Stream real_vs = console;
+        real_vs.add(VsSubobject{.inner = vs});
+        EXPECT(create(device.p, real_vs, refused) == E_NOTIMPL && !refused.p);
+    }
     if (!d.mesh_shader) {
         std::filesystem::remove_all(library);
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
@@ -230,7 +264,7 @@ int main() {
         EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
         EXPECT(create(device.p, mesh_stream, refused, 4) == E_INVALIDARG && !refused.p);  // truncated
         bad = mesh_stream;
-        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 is no subobject type
+        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 with MS: no subobject type
         EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
         Stream empty;
         EXPECT(create(device.p, empty.add(MaskSubobject{.inner = UINT_MAX}), refused) == E_INVALIDARG && !refused.p);

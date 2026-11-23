@@ -3095,9 +3095,50 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
+    D3D12_SHADER_BYTECODE console_hs{};  // subobject type 23, see map_console_stages
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+    bool has_ms = false;
+    bool has_as = false;
+    bool has_console_hs = false;
 };
+
+constexpr unsigned kConsoleHsSubobjectType = 23;
+
+// Subobject types 24 and 23 are not PC D3D12 types for the VS and HS: 24 is the amplification shader and 23 is no
+// type at all. The console's slot 86 streams carry the console VS as 24 and the HS as 23 (TreXito's static reading
+// of the retail title, Leonida#8186). A stream with no MS subobject has no mesh stage, so there they are the VS and
+// the HS. A stream with MS keeps the mesh path: 24 stays an amplification shader (refused by create_graphics), and
+// 23 is an unknown type. A slot already taken by a real VS or HS keeps the old behaviour too.
+HRESULT map_console_stages(PipelineStream& out) {
+    if (!out.has_as && !out.has_console_hs) return S_OK;
+    if (out.has_ms) {
+        if (!out.has_console_hs) return S_OK;
+        log_once("unknown pipeline state stream subobject type:", 23);
+        return E_INVALIDARG;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
+    const auto absent = [](const D3D12_SHADER_BYTECODE& code) { return !code.pShaderBytecode && !code.BytecodeLength; };
+    const bool take_vs = out.has_as && absent(g.VS);
+    const bool take_hs = out.has_console_hs && absent(g.HS);
+    if (out.has_console_hs && !take_hs) {
+        log_once("unknown pipeline state stream subobject type:", 23);
+        return E_INVALIDARG;
+    }
+    if (take_vs) {
+        g.VS = out.as;
+        out.as = {};
+        out.has_as = false;
+    }
+    if (take_hs) {
+        g.HS = out.console_hs;
+        out.console_hs = {};
+        out.has_console_hs = false;
+        out.has_graphics_stage = true;
+    }
+    if (take_vs || take_hs) log_once("console stream subobjects 24 and 23 remapped to VS and HS (no mesh subobject); once", 0);
+    return S_OK;
+}
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
     if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
@@ -3167,8 +3208,14 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: stage(g.DS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+            stage(out.as);
+            out.has_as = true;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+            stage(out.ms);
+            out.has_ms = true;
+            break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
             take(out.compute.CS);
             out.has_cs = true;
@@ -3269,11 +3316,18 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             break;
         }
         default:
-            log_once("unknown pipeline state stream subobject type:", int(type));
-            return E_INVALIDARG;
+            // 23 is not a D3D12 type: the console's HS, kept apart until map_console_stages knows whether there is MS.
+            if (unsigned(type) != kConsoleHsSubobjectType) {
+                log_once("unknown pipeline state stream subobject type:", int(type));
+                return E_INVALIDARG;
+            }
+            take(out.console_hs);
+            out.has_console_hs = true;
+            break;
         }
         if (!ok) return E_INVALIDARG;
     }
+    if (const HRESULT hr = map_console_stages(out); FAILED(hr)) return hr;
     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
     return S_OK;
