@@ -22,6 +22,7 @@
 // Plain word editing, standard library only.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <initializer_list>
 #include <map>
@@ -35,6 +36,7 @@ namespace leonida {
 constexpr std::uint32_t topology_rect_list = 17;
 constexpr std::uint32_t topology_quad_list = 19;
 constexpr std::uint32_t topology_type_rect_list = 19;
+constexpr std::array<std::uint32_t, 6> quad_triangle_indices{0, 1, 2, 0, 2, 3};
 
 // The geometry stage for `vertex_words`' outputs; empty, with `why` set, when the vertex stage cannot be expanded.
 inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint32_t>& vertex_words, std::string& why) {

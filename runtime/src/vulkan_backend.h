@@ -1247,7 +1247,7 @@ public:
         replay_.zero_size = size;
     }
 
-    // 0, 1, 2, ... as 32-bit indices, for non-indexed quad lists (ReplayFunctions::quad_indices).
+    // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
     void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
         std::unique_lock lock(resource_mutex_);
         replay_.quad_indices = buffer;
