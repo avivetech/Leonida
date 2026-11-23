@@ -57,6 +57,12 @@ int main() {
         auto bad = d2d;
         bad.format = 9999;
         CHECK(!suggest_swizzle_mode(bad, 0, mode));
+
+        auto bad_layout = d2d;
+        bad_layout.layout = 0x103;
+        CHECK(!suggest_swizzle_mode(bad_layout, 0, mode));
+        bad_layout.layout = 0x999;
+        CHECK(!suggest_swizzle_mode(bad_layout, 0, mode));
     }
 
     // 2. Linear 2D layout with mips + array slices: verify pitch alignment (256), offset alignment (512),
@@ -161,7 +167,8 @@ int main() {
         CHECK(dst == src);
     }
 
-    // 5. 3D volume texture (linear + swizzled) and depth-stencil multi-plane (D32_FLOAT_S8X24_UINT).
+    // 5. 3D volume texture (linear copy round-trip; swizzled 3D layout succeeds while tiled 3D copy is refused
+    //    without overrunning) and depth-stencil multi-plane (D32_FLOAT_S8X24_UINT).
     {
         XgResourceDesc d3d{};
         d3d.dimension = kDimTexture3D;
@@ -187,6 +194,27 @@ int main() {
         std::vector<std::byte> out(src.size(), std::byte{0});
         CHECK(copy_from_subresource(d3d, layout, out.data(), 0, 0, res.data(), row_pitch, slice_pitch));
         CHECK(out == src);
+
+        // Swizzled 3D volume (64x64x16 RGBA8, SW_64KB_D): layout uses 3D tiles (32x32x16 -> 2x2x1 = 4 tiles = 256 KiB);
+        // subresource copy must refuse cleanly without writing past layout.size_bytes.
+        XgResourceDesc d3d_tiled{};
+        d3d_tiled.dimension = kDimTexture3D;
+        d3d_tiled.width = 64;
+        d3d_tiled.height = 64;
+        d3d_tiled.depth_or_array_size = 16;
+        d3d_tiled.mip_levels = 1;
+        d3d_tiled.format = 28;  // RGBA8
+        d3d_tiled.sample_count = 1;
+        d3d_tiled.layout = kLayoutSw64KbD;
+        XgResourceLayout tiled3d_layout{};
+        CHECK(compute_resource_layout(d3d_tiled, tiled3d_layout));
+        CHECK(tiled3d_layout.plane[0].mip_layout[0].size_bytes == 4u * kTileAlignment);
+        std::vector<std::byte> tiled3d_res(static_cast<std::size_t>(tiled3d_layout.size_bytes), std::byte{0});
+        std::vector<std::byte> linear3d_buf(64u * 64u * 16u * 4u, std::byte{0x5A});
+        CHECK(!copy_into_subresource(d3d_tiled, tiled3d_layout, tiled3d_res.data(), 0, 0, linear3d_buf.data(),
+                                     64u * 4u, 64u * 64u * 4u));
+        CHECK(!copy_from_subresource(d3d_tiled, tiled3d_layout, linear3d_buf.data(), 0, 0, tiled3d_res.data(),
+                                     64u * 4u, 64u * 64u * 4u));
 
         // Two-plane depth-stencil.
         const auto ds = make_2d(128, 128, 1, 1, 20 /* D32_FLOAT_S8X24_UINT */, kLayoutSw64KbD);
@@ -231,13 +259,15 @@ int main() {
         CHECK(past == 0);
     }
 
-    // 7. Error handling: invalid dimensions, unknown format, out-of-range plane/subresource, small pitch.
+    // 7. Error handling: invalid dimensions, unknown format, unknown layout, out-of-range plane/subresource, small pitch.
     {
         XgResourceLayout layout{};
         CHECK(!compute_resource_layout(make_2d(0, 64, 1, 1, 28, kLayoutLinear), layout));
         CHECK(!compute_resource_layout(make_2d(64, 0, 1, 1, 28, kLayoutLinear), layout));
         CHECK(!compute_resource_layout(make_2d(64, 64, 1, 1, 0, kLayoutLinear), layout));
         CHECK(!compute_resource_layout(make_2d(64, 64, 1, 16, 28, kLayoutLinear), layout));
+        CHECK(!compute_resource_layout(make_2d(64, 64, 1, 1, 28, 0x103), layout));
+        CHECK(!compute_resource_layout(make_2d(64, 64, 1, 1, 28, 0x999), layout));
 
         const auto ok = make_2d(16, 16, 1, 1, 28, kLayoutLinear);
         CHECK(compute_resource_layout(ok, layout));

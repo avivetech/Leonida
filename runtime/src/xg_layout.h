@@ -13,6 +13,13 @@
 // - XgMipLevelLayout (0x70 bytes): size_bytes (+0x00), offset_bytes (+0x08), slice_2d_size_bytes (+0x10),
 //   pitch_pixels (+0x18), pitch_bytes (+0x1C), padded/unpadded element counts, sample count, and tile mode.
 // - XgPackedMipDesc / XgTileShape / XgSubresourceTiling (0x0C bytes each): identical layout to D3D12's tiling structs.
+//
+// Scope / simplifications of the current layout model:
+// - Mips are placed largest-first with each tiled mip rounded up to whole tiles (no GFX10 mip-tail packing; console
+//   mip-tail layout remains open per docs/d3d12_vulkan.md).
+// - Subresource copy supports 1D/2D/2D-array/3D linear textures and 2D/2D-array swizzled textures via TiledSurface2D.
+//   Swizzled 3D subresource copy is refused (returns false) until 3D tile swizzle addressing is implemented.
+// - Unknown desc.layout words are rejected rather than defaulted.
 
 #include "gfx10_tiling.h"
 #include "resource_tiling.h"
@@ -280,6 +287,22 @@ constexpr std::uint32_t resolve_mip_count(const XgResourceDesc& desc) {
     return mips;
 }
 
+constexpr bool is_known_layout(std::uint32_t layout) {
+    switch (layout) {
+    case kLayoutUnknown:
+    case kLayoutRowMajor:
+    case kLayout64KbUndefinedSwizzle:
+    case kLayout64KbStandardSwizzle:
+    case kLayoutLinear:
+    case kLayoutSw64KbD:
+    case kLayoutSw4KbS:
+    case kLayoutSw64KbReserved:
+        return true;
+    default:
+        return false;
+    }
+}
+
 constexpr bool is_linear_layout(std::uint32_t layout, std::uint32_t dimension) {
     return dimension == kDimBuffer || dimension == kDimTexture1D ||
            layout == kLayoutRowMajor || layout == kLayoutLinear;
@@ -301,6 +324,7 @@ constexpr bool validate_texture_desc(const XgResourceDesc& desc, FormatInfo& fmt
     if (desc.dimension != kDimTexture1D && desc.dimension != kDimTexture2D && desc.dimension != kDimTexture3D) {
         return false;
     }
+    if (!is_known_layout(desc.layout)) return false;
     if (desc.width == 0 || desc.width > 65536u) return false;
     height = (desc.dimension == kDimTexture1D) ? 1u : desc.height;
     if (height == 0 || height > 65536u) return false;
@@ -541,6 +565,7 @@ inline bool transfer_subresource(const XgResourceDesc& desc, const XgResourceLay
     if (bpe == 0 || ml.width_elements == 0 || ml.height_elements == 0) return false;
 
     const std::uint32_t z_slices = is_3d ? ml.depth_or_array : 1u;
+    if (z_slices == 0) return false;
     const std::uint64_t row_bytes = std::uint64_t{ml.width_elements} * bpe;
     const std::uint64_t eff_row_pitch = (linear_row_pitch == 0 && ml.height_elements == 1) ? row_bytes : linear_row_pitch;
     if (eff_row_pitch < row_bytes) return false;
@@ -560,6 +585,16 @@ inline bool transfer_subresource(const XgResourceDesc& desc, const XgResourceLay
 
     if (linear) {
         if (ml.pitch_bytes < row_bytes) return false;
+        std::uint64_t required_slice = 0;
+        std::uint64_t last_slice_offset = 0;
+        std::uint64_t total_needed = 0;
+        if (!checked_mul(std::uint64_t{ml.height_elements}, ml.pitch_bytes, required_slice)) return false;
+        if (z_slices > 1 && ml.slice_2d_size_bytes < required_slice) return false;
+        if (!checked_mul(std::uint64_t{z_slices - 1u}, ml.slice_2d_size_bytes, last_slice_offset) ||
+            !checked_add(last_slice_offset, required_slice, total_needed) ||
+            total_needed > ml.size_bytes) {
+            return false;
+        }
         for (std::uint32_t z = 0; z < z_slices; ++z) {
             std::byte* res_slice = res_mip + std::uint64_t{z} * ml.slice_2d_size_bytes;
             std::byte* lin_slice = linear_base + std::uint64_t{z} * eff_slice_pitch;
@@ -573,30 +608,24 @@ inline bool transfer_subresource(const XgResourceDesc& desc, const XgResourceLay
         return true;
     }
 
+    // Swizzled 3D volumes pack 3D tiles (depth > 1 per tile) rather than independent 2D slices;
+    // TiledSurface2D cannot address 3D tiles and stepping z * slice_2d_size_bytes would overrun ml.size_bytes.
+    if (is_3d) return false;
+
     // Swizzled 2D slices (GFX10 SW_64KB_D or SW_4KB_S) via TiledSurface2D.
     const gfx10::TileMode mode = (ml.tile_mode == kLayoutSw4KbS) ? gfx10::TileMode::sw_4kb_s : gfx10::TileMode::sw_64kb_d;
     gfx10::TiledSurface2D surf{};
     if (!gfx10::TiledSurface2D::make(mode, bpe, ml.width_elements, ml.height_elements, surf)) return false;
-    if (surf.tiled_size() > ml.slice_2d_size_bytes) return false;
+    if (surf.tiled_size() > ml.size_bytes || surf.tiled_size() > ml.slice_2d_size_bytes) return false;
 
-    for (std::uint32_t z = 0; z < z_slices; ++z) {
-        std::byte* res_slice = res_mip + std::uint64_t{z} * ml.slice_2d_size_bytes;
-        std::byte* lin_slice = linear_base + std::uint64_t{z} * eff_slice_pitch;
-        if (into_resource) {
-            if (!surf.tile(std::span<const std::byte>(lin_slice, static_cast<std::size_t>(tight_slice)),
-                           std::span<std::byte>(res_slice, surf.tiled_size()),
-                           static_cast<std::size_t>(eff_row_pitch))) {
-                return false;
-            }
-        } else {
-            if (!surf.detile(std::span<const std::byte>(res_slice, surf.tiled_size()),
-                             std::span<std::byte>(lin_slice, static_cast<std::size_t>(tight_slice)),
-                             static_cast<std::size_t>(eff_row_pitch))) {
-                return false;
-            }
-        }
+    if (into_resource) {
+        return surf.tile(std::span<const std::byte>(linear_base, static_cast<std::size_t>(tight_slice)),
+                         std::span<std::byte>(res_mip, surf.tiled_size()),
+                         static_cast<std::size_t>(eff_row_pitch));
     }
-    return true;
+    return surf.detile(std::span<const std::byte>(res_mip, surf.tiled_size()),
+                       std::span<std::byte>(linear_base, static_cast<std::size_t>(tight_slice)),
+                       static_cast<std::size_t>(eff_row_pitch));
 }
 
 }  // namespace detail
