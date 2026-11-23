@@ -44,6 +44,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -4137,8 +4138,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
                 else
                     vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-                const std::uint32_t quads = std::min(draw->count / 4, generated ? vk.quad_index_count / 4 : UINT32_MAX);
+                // The shared buffer holds quad_index_count / 4 quads: more are cut off here and said so.
+                const std::uint32_t wanted = draw->count / 4, room = generated ? vk.quad_index_count / 4 : UINT32_MAX;
+                const std::uint32_t quads = std::min(wanted, room);
+                if (quads < wanted)
+                    std::fprintf(stderr, "[rt] d3d12: a non-indexed quad list of %u quads draws only the first %u\n",
+                                 wanted, quads);
                 const std::int32_t vertex_offset = generated ? std::int32_t(draw->first) : draw->base_vertex;
+                // All the instances of a quad are drawn together (a split by instance would zero the translated
+                // instance id, InstanceIndex - BaseInstance), so with several instances the primitive order is quad
+                // by quad, not instance by instance: only overlapping blended instances can tell.
                 for (std::uint32_t quad = 0; quad < quads; ++quad)
                     vk.draw_indexed(command_buffer, 4, draw->instances, (generated ? 0 : draw->first) + 4 * quad,
                                     vertex_offset, draw->first_instance);
