@@ -3590,8 +3590,9 @@ public:
     // are recorded as no-ops (D3D-482). No game shader runs; the boot gets past a title that refuses to go on when
     // pipeline creation fails.
     static bool stub_pipelines() {
-        const char* v = std::getenv("LEONIDA_STUB_PIPELINES");
-        return v && *v && *v != '0';
+        wchar_t v[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
+        return n > 0 && n < 8 && v[0] != L'0';
     }
     HRESULT stub_or(HRESULT hr, const char* what) {
         if (!stub_pipelines()) return hr;
