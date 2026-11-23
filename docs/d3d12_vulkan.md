@@ -1646,8 +1646,23 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    translator input. No stride is read at run time: static offsets of T# loads are multiples of 32 and of S# loads
    multiples of 16, so the stride is compiled into the code. In the runtime shim, `CreateRootSignature` records the
    `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and `SAMPLER_HEAP_DIRECTLY_INDEXED` root-signature flags and `SetDescriptorHeaps`
-   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`), while placing those bases into
-   per-stage user SGPRs remains open on question 3.
+   tracks the bound shader-visible heap GPU bases (`d3d12_set_descriptor_heaps`).
+   **Where the bases go (measured, compute):** right after the root arguments, the CBV/SRV/UAV heap's base first if
+   the root signature sets `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, then the sampler heap's if it sets
+   `SAMPLER_HEAP_DIRECTLY_INDEXED`. Over the corpus, the 620 compute shaders with a run-time heap load read the
+   CBV/SRV/UAV base at `USER_SGPR - 2` (sampler base at `USER_SGPR - 1`) or at `USER_SGPR - 1`; on the retail boot,
+   the 67 heap-indexing library compute shaders it creates agree (60 read the CBV/SRV/UAV base at `USER_SGPR - 1`,
+   7 at `USER_SGPR - 2`), every compute pipeline without a heap flag has `USER_SGPR` = 4 + its root arguments (42 of
+   42), and the same order holds in the pixel stage counted from `s8`: all 453 pixel shaders whose signature sets a
+   heap flag and that load from a heap at a run-time offset read the base in exactly that SGPR. `pack_stage` gives the two SGPRs
+   (`resource_heap_sgpr`, `sampler_heap_sgpr`), and `Dispatch` and a dispatch `ExecuteIndirect` write the bound heaps' 32-bit base VAs there (`d3d12_heap_index`).
+   On that boot 13 of about 45 root signatures set a heap flag, and the title binds one CBV/SRV/UAV heap (1,245,184
+   descriptors) and one sampler heap (128) with every `SetDescriptorHeaps`.
+   **Still open:** the graphics stages (their root-argument layout, question 3, is the `pack()` model from `s0`,
+   while the game's VS/PS read their root tables from `s8` and MS from `s16`), and the sampler heap's stride: the
+   shaders step a sampler-heap index by 16 bytes (`s_lshl_b32 ..., 4`), while `GetDescriptorHandleIncrementSize`
+   answers 32 for every heap type, so a sampler at index 1 or more is read from the wrong slot until the sampler
+   heap's increment is 16.
 3. **Game-built descriptor memory.** The game writes raw T#/S# bytes into a heap itself, without calling
    `CreateShaderResourceView`. The shaders then read those bytes exactly as in case 1.
 
@@ -1947,7 +1962,9 @@ Things that can invalidate this simple model, all **Open**:
   (and below `s32` for the graphics stages, whose user count is not measured yet), and the stride is compiled into
   the shader's offsets. So the translator needs no new runtime value; the layer has to write the bound heap bases
   into the user-data slots the root-signature mapping assigns them. The root signature
-  flag tells us direct indexing is enabled; the shader's address arithmetic identifies the base.
+  flag tells us direct indexing is enabled; the shader's address arithmetic identifies the base. Compute: the
+  SGPRs right after the root arguments, the CBV/SRV/UAV heap's first (section 3.4, `pack_stage`), written at each
+  dispatch. Graphics: open with the graphics layout.
 - **Static samplers.** D3D12 static samplers do not consume root parameters. The console driver may place their
   S# values in a fixed table. The layer registers every static sampler's S# in the hash table, so a shader that
   loads it by value works; a shader that expects a driver table needs that table's location (**Open**).

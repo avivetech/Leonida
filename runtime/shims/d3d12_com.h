@@ -382,6 +382,10 @@ struct RootArgumentLayout {
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
+    // Compute: the user SGPRs that take the bound heaps' base VAs when the flags ask for direct heap indexing
+    // (pack_stage; docs/d3d12_vulkan.md section 3.4). kNoSgpr when the flag is clear.
+    std::uint32_t compute_resource_heap_sgpr = rt::rootsig::kNoSgpr;
+    std::uint32_t compute_sampler_heap_sgpr = rt::rootsig::kNoSgpr;
     bool graphics_ok = true;
     bool compute_ok = true;
 };

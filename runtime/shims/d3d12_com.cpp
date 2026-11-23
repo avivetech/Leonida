@@ -882,7 +882,8 @@ public:
             if (stub_pipeline_) return;
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
-            cmd.user_data = compute_.data;
+            note_direct_heap_indexing(compute_.layout, true);
+            cmd.user_data = compute_user_data();
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1326,20 +1327,37 @@ private:
         if ((cbv && cbv != cbv_srv_uav_heap_) || (smp && smp != sampler_heap_)) check(false);
     }
 
-    void note_direct_heap_indexing(const RootArgumentLayout* layout) const {
+    void note_direct_heap_indexing(const RootArgumentLayout* layout, bool compute) const {
         if (!layout) return;
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
             if (!cbv_srv_uav_heap_)
                 note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
-            else
-                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+            else if (!compute)
+                note_once("draw uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED; the graphics heap-base SGPR is not placed "
+                          "(graphics root layout open, section 3.5)");
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
                 note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
-            else
-                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list (SGPR slot open, section 3.4)");
+            else if (!compute)
+                note_once("draw uses SAMPLER_HEAP_DIRECTLY_INDEXED; the graphics heap-base SGPR is not placed "
+                          "(graphics root layout open, section 3.5)");
         }
+    }
+
+    // The user data a dispatch records: the compute root arguments, plus the 32-bit VA of each bound heap's first
+    // descriptor in the SGPR the signature gives it for direct heap indexing (pack_stage, section 3.4). The heaps
+    // live in the GPU address arena, below 4 GiB, like the descriptor tables. A heap the signature indexes but the
+    // list has not bound leaves its SGPR 0 (noted once): D3D12 leaves that case undefined.
+    std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> compute_user_data() const {
+        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data = compute_.data;
+        const RootArgumentLayout* layout = compute_.layout;
+        if (!layout) return data;
+        if (layout->compute_resource_heap_sgpr < data.size())
+            data[layout->compute_resource_heap_sgpr] = std::uint32_t(cbv_srv_uav_base_);
+        if (layout->compute_sampler_heap_sgpr < data.size())
+            data[layout->compute_sampler_heap_sgpr] = std::uint32_t(sampler_base_);
+        return data;
     }
 
     void reset_state(ID3D12PipelineState* state) {
@@ -1382,8 +1400,8 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (stub_pipeline_) return;
         if (!compute_pipeline_ || !compute_.layout) return check(false);
-        note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        note_direct_heap_indexing(compute_.layout, true);
+        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1403,7 +1421,7 @@ private:
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (stub_pipeline_) return;
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
-        note_direct_heap_indexing(graphics_.layout);
+        note_direct_heap_indexing(graphics_.layout, false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;

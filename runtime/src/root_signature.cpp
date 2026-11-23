@@ -83,6 +83,23 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         first.push_back(static_cast<uint32_t>(next));
         next += dwords;
     }
+    // The heap bases follow the last parameter, the CBV/SRV/UAV heap's first (docs/d3d12_vulkan.md section 3.4).
+    const struct {
+        uint32_t flag;
+        uint32_t* slot;
+        const char* name;
+    } heaps[] = {{kFlagResourceHeapDirectlyIndexed, &out.resource_heap_sgpr, "CBV/SRV/UAV"},
+                 {kFlagSamplerHeapDirectlyIndexed, &out.sampler_heap_sgpr, "sampler"}};
+    for (const auto& heap : heaps) {
+        if (!(sig.flags & heap.flag)) continue;
+        if (next + 1 > kMaxUserSgprs) {
+            out.resource_heap_sgpr = out.sampler_heap_sgpr = kNoSgpr;
+            out.error = std::string("the ") + heap.name + " heap base does not fit in the user SGPRs from s" +
+                        std::to_string(out.base) + " (spill array not modelled)";
+            return out;
+        }
+        *heap.slot = static_cast<uint32_t>(next++);
+    }
     out.first_sgpr = std::move(first);
     out.end_sgpr = static_cast<uint32_t>(next);
     out.d3d12_cost = static_cast<uint32_t>(cost);

@@ -422,6 +422,49 @@ int main() {
         // An empty signature is valid and uses nothing.
         const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
         check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
+        check(empty.resource_heap_sgpr == kNoSgpr && empty.sampler_heap_sgpr == kNoSgpr,
+              "pack_stage: no heap-indexing flag, no heap SGPR");
+    }
+
+    // pack_stage: the bound heaps' bases follow the root arguments, CBV/SRV/UAV first (D3D-329). The shape of the
+    // game's commonest heap-indexing compute shader: two tables at s4/s5, four more dwords, the CBV/SRV/UAV heap base
+    // at s10 and the sampler heap base at s11, 12 user SGPRs.
+    {
+        RootSignature both;
+        both.params = {table(), table(), view(), view()};
+        both.flags = kFlagResourceHeapDirectlyIndexed | kFlagSamplerHeapDirectlyIndexed;
+        const StagePackResult r = pack_stage(both, Stage::Compute);
+        check(r.ok && r.first_sgpr == std::vector<uint32_t>({4, 5, 6, 8}) && r.resource_heap_sgpr == 10 &&
+                  r.sampler_heap_sgpr == 11 && r.end_sgpr == 12,
+              "pack_stage: CBV/SRV/UAV heap base at s10, sampler heap base at s11, 12 user SGPRs");
+        RootSignature res = both;
+        res.flags = kFlagResourceHeapDirectlyIndexed;
+        const StagePackResult rr = pack_stage(res, Stage::Compute);
+        check(rr.ok && rr.resource_heap_sgpr == 10 && rr.sampler_heap_sgpr == kNoSgpr && rr.end_sgpr == 11,
+              "pack_stage: CBV/SRV/UAV heap only");
+        RootSignature smp = both;
+        smp.flags = kFlagSamplerHeapDirectlyIndexed | 0x03000000u;  // the Xbox type byte does not move anything
+        const StagePackResult rs = pack_stage(smp, Stage::Compute);
+        check(rs.ok && rs.resource_heap_sgpr == kNoSgpr && rs.sampler_heap_sgpr == 10 && rs.end_sgpr == 11,
+              "pack_stage: sampler heap only takes the first free SGPR");
+        RootSignature none = both;
+        none.flags = 0;
+        const StagePackResult rn = pack_stage(none, Stage::Compute);
+        check(rn.ok && rn.resource_heap_sgpr == kNoSgpr && rn.sampler_heap_sgpr == kNoSgpr && rn.end_sgpr == 10,
+              "pack_stage: the same signature without the flags ends at s10");
+
+        // The heap bases count against the 28 compute SGPRs: one free slot takes the CBV/SRV/UAV base but not both.
+        RootSignature full;
+        full.params = {consts(27)};
+        full.flags = kFlagResourceHeapDirectlyIndexed;
+        const StagePackResult f1 = pack_stage(full, Stage::Compute);
+        check(f1.ok && f1.resource_heap_sgpr == 31 && f1.end_sgpr == 32, "pack_stage: heap base in s31");
+        full.flags |= kFlagSamplerHeapDirectlyIndexed;
+        const StagePackResult f2 = pack_stage(full, Stage::Compute);
+        check(!f2.ok && f2.first_sgpr.empty() && f2.resource_heap_sgpr == kNoSgpr &&
+                  f2.error.find("sampler heap base") != std::string::npos &&
+                  f2.error.find("spill") != std::string::npos,
+              "pack_stage: a heap base that does not fit is refused and named");
     }
 
     // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
