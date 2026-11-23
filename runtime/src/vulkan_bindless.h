@@ -243,21 +243,22 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
-    // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
-    // take descriptors away.
-    const auto apply = [&](bool final) {
+    // Cap 2D storage by 2D images everywhere except step 1's initial storage pass, where 2D images are still 1.
+    // Otherwise 2D images, non-2D storage, MS selection, set_limit and layout_supported are charged for 2D storage
+    // slots that the final cap discards.
+    const auto apply = [&](bool cap_2d) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
-            const bool capped = final || dimension != ImageDimension::dim_2d;
+            const bool capped = cap_2d || dimension != ImageDimension::dim_2d;
             const std::uint32_t held = capped ? std::min(storage, counts[sampled_binding(dimension)]) : storage;
             for (std::uint32_t c = 0; c < 3; ++c) counts[storage_binding(dimension, c)] = held;
             if (r32ui_binding(dimension) != no_binding) counts[r32ui_binding(dimension)] = held;
         }
     };
-    const auto fits = [&](std::uint32_t headroom, std::uint64_t set_limit) {
-        apply(false);
+    const auto fits = [&](std::uint32_t headroom, std::uint64_t set_limit, bool cap_2d = true) {
+        apply(cap_2d);
         std::uint64_t sampled = 0, sampler = 0, stored = 0, buffers = 0;
         for (std::uint32_t b = 0; b < binding_count; ++b) {
             if (!binding_enabled(b, features)) continue;
@@ -274,11 +275,12 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
                (all <= set_limit || (layout_supported && layout_supported(features)));
     };
     // Raises n to the largest value up to `high` that fits; leaves it where it is when none does.
-    const auto grow = [&](std::uint32_t& n, std::uint32_t high, std::uint32_t headroom, std::uint64_t set_limit) {
+    const auto grow = [&](std::uint32_t& n, std::uint32_t high, std::uint32_t headroom, std::uint64_t set_limit,
+                          bool cap_2d = true) {
         std::uint32_t low = n;
         while (low < high) {
             n = low + (high - low + 1) / 2;
-            if (fits(headroom, set_limit)) low = n;
+            if (fits(headroom, set_limit, cap_2d)) low = n;
             else high = n - 1;
         }
         n = low;
@@ -288,9 +290,10 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     const auto ms_samples = features.ms_samples;
     features.ms_samples.fill(VK_SAMPLE_COUNT_1_BIT);
     grow(samplers, bindings[sampler_binding].count, 0, no_limit);
-    grow(storage, bindings[storage_binding(ImageDimension::dim_2d, 0)].count, 0, no_limit);
+    grow(storage, bindings[storage_binding(ImageDimension::dim_2d, 0)].count, 0, no_limit, false);
     grow(images, bindings[sampled_binding(ImageDimension::dim_2d)].count, 0, no_limit);
-    apply(false);
+    grow(storage, bindings[storage_binding(ImageDimension::dim_2d, 0)].count, 0, no_limit);
+    apply(true);
     const bool full = images == bindings[0].count && samplers == bindings[sampler_binding].count &&
                       storage == bindings[storage_binding(ImageDimension::dim_2d, 0)].count;
     features.ms_samples = ms_samples;

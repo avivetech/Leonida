@@ -144,6 +144,80 @@ int main() {
         EXPECT(storage_consistent(f));
     }
 
+    // Tight per-stage resources where storage clamps below 256: 2D images are not starved by uncapped 2D storage
+    // descriptors that the final cap would discard.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.limits.maxPerStageDescriptorSampledImages = d.limits.maxDescriptorSetSampledImages = 4000;
+        d.limits.maxPerStageDescriptorStorageImages = d.limits.maxDescriptorSetStorageImages = 3584;
+        d.limits.maxPerStageResources = 4500;
+        BindlessFeatures f = with_ms(false);
+        EXPECT(!bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        const Totals t = totals(f);
+        EXPECT(count(f, D::dim_2d) == 169 && storage(f, D::dim_2d) == 169);
+        EXPECT(storage(f, D::dim_2d_array) == 211 && storage(f, D::dim_3d) == 211 && storage(f, D::dim_1d) == 211);
+        EXPECT(t.sampled <= 4000 && t.storage <= 3584 && t.sampled + t.storage + 1 + 8 == 4500);
+        EXPECT(storage_consistent(f));
+    }
+
+    // Tight sampled-image limit alongside tight per-stage resources or storage limits: capping 2D storage to the
+    // smaller 2D image count lets 2D images grow to the sampled limit and reclaims the freed slots for non-2D storage.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.limits.maxPerStageDescriptorSampledImages = d.limits.maxDescriptorSetSampledImages = 1600;
+        d.limits.maxPerStageDescriptorStorageImages = d.limits.maxDescriptorSetStorageImages = 3584;
+        d.limits.maxPerStageResources = 4500;
+        BindlessFeatures f = with_ms(false);
+        EXPECT(!bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        const Totals t = totals(f);
+        EXPECT(count(f, D::dim_2d) == 64 && storage(f, D::dim_2d) == 64);
+        EXPECT(storage(f, D::dim_2d_array) == 256 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
+        EXPECT(t.sampled == 1600 && t.storage == 4 * 64 + 10 * 256 && t.sampled + t.storage + 1 + 8 <= 4500);
+        EXPECT(storage_consistent(f));
+
+        Device storage_tight = uniform(1048576, 1048576);
+        storage_tight.limits.maxPerStageDescriptorSampledImages =
+            storage_tight.limits.maxDescriptorSetSampledImages = 1600;
+        storage_tight.limits.maxPerStageDescriptorStorageImages =
+            storage_tight.limits.maxDescriptorSetStorageImages = 2816;
+        f = with_ms(false);
+        EXPECT(!bindless::size_bindings(f, storage_tight.limits, storage_tight.v11, storage_tight.v12));
+        EXPECT(count(f, D::dim_2d) == 64 && storage(f, D::dim_2d) == 64);
+        EXPECT(storage(f, D::dim_2d_array) == 256 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
+        EXPECT(totals(f).storage == 2816 && storage_consistent(f));
+    }
+
+    // Tight update-after-bind pool limit: 2D images are not starved by uncapped 2D storage, and every candidate passed
+    // to layout_supported has consistent (capped) 2D storage counts.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.v12.maxUpdateAfterBindDescriptorsInAllPools = 6000;
+        BindlessFeatures f = with_ms(true);
+        EXPECT(!bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == 197 && storage(f, D::dim_2d) == 197);
+        EXPECT(storage(f, D::dim_2d_array) == 245 && storage(f, D::dim_3d) == 245 && storage(f, D::dim_1d) == 245);
+        EXPECT(f.counts[bindless::sampler_binding] == 1028 && totals(f).all == 6000);
+        EXPECT(storage_consistent(f));
+
+        Device callback_dev = uniform(1048576, 1048576);
+        callback_dev.v12.maxUpdateAfterBindDescriptorsInAllPools = 5900;
+        callback_dev.v11.maxPerSetDescriptors = 1024;
+        unsigned asked = 0;
+        bool all_consistent = true;
+        const auto check_candidate = [&](const BindlessFeatures& candidate) {
+            ++asked;
+            all_consistent = all_consistent && storage_consistent(candidate);
+            return true;
+        };
+        f = with_ms(true);
+        EXPECT(!bindless::size_bindings(f, callback_dev.limits, callback_dev.v11, callback_dev.v12, check_candidate));
+        EXPECT(asked > 0 && all_consistent);
+        EXPECT(count(f, D::dim_2d) == 191 && storage(f, D::dim_2d) == 191);
+        EXPECT(storage(f, D::dim_2d_array) == 238 && storage(f, D::dim_3d) == 238 && storage(f, D::dim_1d) == 238);
+        EXPECT(f.counts[bindless::sampler_binding] == 1028 && totals(f).all == 5900);
+        EXPECT(storage_consistent(f));
+    }
+
     // Update-after-bind and plain limits differ: each layout is sized by its own.
     {
         const Device d = uniform(16384, 1048576);
