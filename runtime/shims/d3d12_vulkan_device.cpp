@@ -2689,10 +2689,13 @@ public:
 
     // D3D12 answers only for committed and placed resources (E_INVALIDARG for reserved ones, measured on the PC
     // runtime).
-    // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
-    // structure reports its real device address (instance descriptors and builds hand it to the driver); other
-    // buffers report their console VA into the GPU address arena.
+    // Buffers only, as on PC D3D12; ordinary textures return 0 (images are reached through descriptors), while
+    // Xbox slot-133 placed textures record the title's placement address (set_title_va) because the console title
+    // reads it back through GetGPUVirtualAddress(). An acceleration structure reports its real device address
+    // (instance descriptors and builds hand it to the driver); other buffers report their console VA into the GPU
+    // address arena.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    void set_title_va(D3D12_GPU_VIRTUAL_ADDRESS va) { va_ = va; }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -7760,6 +7763,10 @@ public:
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &pc_desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
                                       riid, out);
+            if (SUCCEEDED(hr) && out && *out && address) {
+                if (auto* r = Resource::from<Resource>(reinterpret_cast<IUnknown*>(*out)))
+                    r->set_title_va(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+            }
             return d3d12_trace::result(method, hr);
         }
         D3D12_HEAP_PROPERTIES heap{};

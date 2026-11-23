@@ -223,10 +223,15 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
     texture.Width = texture.Height = 64;
     texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal.
+    // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal,
+    // and GetGPUVirtualAddress() preserves the title's placement address (Xbox titles read it back).
     Ref<ID3D12Resource> placed_texture;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&placed_texture.p)), S_OK);
     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+    EXPECT(placed_texture->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+    Ref<ID3D12Resource> null_va_texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, nullptr, texture, 0x6u, IID_PPV_ARGS(&null_va_texture.p)), S_OK);
+    EXPECT(null_va_texture.p != nullptr && null_va_texture->GetGPUVirtualAddress() == 0);
     // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
     Ref<ID3D12Resource> fallback;
     EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
