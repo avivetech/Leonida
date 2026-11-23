@@ -15847,6 +15847,40 @@ def halves_analysis(g, blocks, succ):
         raise Unsupported("wave64 graphics tier C: " + ", ".join(g.w64g["reasons"]))
 
 
+# The 64-bit VALU lane masks a wave64 program reads or writes in an SGPR, by base op: operand positions in the listing
+# (destination first). In wave64 these are SGPR pairs (RDNA2 ISA: VOP3's SSRC2 of v_cndmask, VOP3b's SDST), but a
+# listing disassembled in llvm-mc's default wave32 mode, as tools/shader_disasm.py prints every program, names just the
+# pair's first register ("s6" for s[6:7]); the encoding is the same in both modes. The VOP2/VOPC forms take VCC
+# implicitly (printed vcc_lo), so only an SGPR operand at these positions is a pair.
+WAVE64_MASK_OPERANDS = {
+    "v_cndmask_b32": (3,),                                                # condition (VOP3 SSRC2)
+    "v_add_co_u32": (1,), "v_sub_co_u32": (1,), "v_subrev_co_u32": (1,),  # carry out (VOP3b SDST)
+    "v_add_co_ci_u32": (1, 4), "v_sub_co_ci_u32": (1, 4), "v_subrev_co_ci_u32": (1, 4),   # carry out, carry in
+    "v_mad_u64_u32": (1,), "v_mad_i64_i32": (1,),                         # carry out
+    "v_div_scale_f32": (1,), "v_div_scale_f64": (1,),                     # VCC-style result
+}
+
+
+def widen_wave64_lane_masks(insns):
+    """Turn each wave32-printed lane mask of a wave64 program into the SGPR pair it is: s6 -> s[6:7] at the positions
+    WAVE64_MASK_OPERANDS lists and in the destination of v_cmp_*_e64 (v_cmpx writes EXEC). A pair is even-aligned;
+    an odd register is left as it is. A listing already in wave64 syntax (s[6:7]) is unchanged."""
+    out = []
+    for ins in insns:
+        b = base_op(ins["op"])
+        positions = WAVE64_MASK_OPERANDS.get(b, ())
+        if b.startswith("v_cmp_"):
+            positions = (0,)
+        args = ins["args"]
+        widen = [k for k in positions if k < len(args) and args[k].get("k") == "sgpr" and args[k].get("n", 1) == 1
+                 and args[k].get("r", 1) % 2 == 0]
+        if widen:
+            args = [dict(a, n=2) if k in widen else a for k, a in enumerate(args)]
+            ins = {**ins, "args": args}
+        out.append(ins)
+    return out
+
+
 def fold_far_branches(insns):
     """s_getpc_b64 s[a:a+1]; s_add_u32 sa, sa, K; s_addc_u32 sa+1, sa+1, 0|-1; s_setpc_b64 s[a:a+1] is a far
     branch (s_branch only reaches +-32K dwords): the target is the address after s_getpc plus K. Fold the four
@@ -16770,6 +16804,8 @@ def translate(path):
         g.wave64 = fspx_ws == 64
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if g.wave64:
+        insns = widen_wave64_lane_masks(insns)   # a wave32-printed listing names a mask pair by its first SGPR
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
