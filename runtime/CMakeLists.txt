@@ -1962,6 +1962,20 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_texture3d_uav COMMAND d3d12_texture3d_uav_test)
     set_tests_properties(d3d12_texture3d_uav PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    # The compute shader that reads and writes the 3D UAVs through set 0's 3D storage bindings (GLSL, compiled here).
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_TEXTURE3D_UAV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_texture3d_uav.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_TEXTURE3D_UAV}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_TEXTURE3D_UAV}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_texture3d_uav.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_texture3d_uav.comp
+        COMMENT "Compiling cs_texture3d_uav.comp"
+        VERBATIM)
+      target_sources(d3d12_texture3d_uav_test PRIVATE ${LEONIDA_TEST_CS_TEXTURE3D_UAV})
+      target_compile_definitions(d3d12_texture3d_uav_test PRIVATE
+        LEONIDA_TEST_CS_TEXTURE3D_UAV_SPV="${LEONIDA_TEST_CS_TEXTURE3D_UAV}")
+    endif()
 
     add_executable(d3d12_short_uav_clear_test test/d3d12_short_uav_clear_test.cpp)
     target_link_libraries(d3d12_short_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)

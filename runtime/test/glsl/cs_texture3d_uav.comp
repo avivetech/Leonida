@@ -1,0 +1,53 @@
+#version 460
+// Compute shader for d3d12_texture3d_uav_test: reads and writes an R32_UINT TEXTURE3D UAV through set 0's 3D storage
+// bindings, the way a translated RWTexture3D<uint> shader reaches them: it finds the image's index from the UAV's T#
+// through the descriptor hash table (binding 2), then each invocation adds delta(x, y, z) to its texel, the even
+// texels with an atomic add on the 3D r32ui binding (7) and the odd ones with a load and a store on the 3D uint
+// binding (15). Texel (x, y, z) of the view's mip ends at its old value + delta, so a write to the wrong mip, Z slice
+// or texel, or none at all, shows in the readback.
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(push_constant) uniform Params {
+    uint tsharp[8];
+    uint width;   // the view's mip
+    uint height;
+    uint depth;
+    uint tag;
+} pc;
+
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];
+};
+layout(set = 0, binding = 7, r32ui) uniform coherent uimage3D storage_r32ui_3d[];
+layout(set = 0, binding = 15, r32ui) uniform coherent uimage3D storage_uint_3d[];
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    const uvec3 p = gl_GlobalInvocationID;
+    if (p.x >= pc.width || p.y >= pc.height || p.z >= pc.depth) return;
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = pc.tsharp[k];
+    const uint image = lookup(key);  // the same for every invocation (dynamically uniform)
+    const uint delta = pc.tag + (p.z << 16) + (p.y << 8) + p.x;
+    const ivec3 xyz = ivec3(p);
+    if (((p.x + p.y + p.z) & 1u) == 0u) {
+        imageAtomicAdd(storage_r32ui_3d[image], xyz, delta);
+    } else {
+        const uint old = imageLoad(storage_uint_3d[image], xyz).x;
+        imageStore(storage_uint_3d[image], xyz, uvec4(old + delta, 0u, 0u, 0u));
+    }
+}

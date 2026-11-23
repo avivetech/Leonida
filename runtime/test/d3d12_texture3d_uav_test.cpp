@@ -1,9 +1,13 @@
 // CreateUnorderedAccessView on 3D textures (null desc and D3D12_UAV_DIMENSION_TEXTURE3D) through the Vulkan-backed
 // D3D12 device: verifies the GFX10 T# written into the heap slot, GPU ClearUnorderedAccessViewFloat/Uint using
 // those views with full-volume readback, and rejection of out-of-range, partial W-slice, sRGB, and mismatched views.
+// Where glslangValidator compiled test/glsl/cs_texture3d_uav.comp and the device has the bindless set 0, a compute
+// shader also reads and writes an R32_UINT volume through a null-desc UAV (mip 0, every Z slice) and an explicit
+// TEXTURE3D UAV of mip 1, through set 0's 3D storage bindings (r32ui 7 and uint 15), and the readback checks every
+// texel of both mips.
 //
-// No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
-// error fails the test.
+// No game shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any
+// validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
@@ -14,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -147,7 +152,134 @@ struct Harness {
         rb->Unmap(0, nullptr);
         return true;
     }
+
+    // Writes tightly-packed [z][y][x] 4-byte texels into one mip of a 3D texture left in UNORDERED_ACCESS.
+    bool upload_3d_mip(ID3D12Resource* tex, DXGI_FORMAT format, UINT width, UINT height, UINT depth, UINT mip,
+                       const std::vector<std::uint32_t>& texels) {
+        const UINT mw = std::max(1u, width >> mip);
+        const UINT mh = std::max(1u, height >> mip);
+        const UINT md = std::max(1u, depth >> mip);
+        if (texels.size() != std::size_t(mw) * mh * md) return false;
+        const UINT pitch = (mw * 4 + 255) / 256 * 256;
+
+        D3D12_RESOURCE_DESC up_desc{};
+        up_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        up_desc.Width = UINT64(pitch) * mh * md;
+        up_desc.Height = 1;
+        up_desc.DepthOrArraySize = 1;
+        up_desc.MipLevels = 1;
+        up_desc.SampleDesc.Count = 1;
+        up_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Ref<ID3D12Resource> up = committed(up_desc, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!up.p) return false;
+        void* mapped = nullptr;
+        if (FAILED(up->Map(0, nullptr, &mapped)) || !mapped) return false;
+        auto* base = static_cast<std::uint8_t*>(mapped);
+        for (UINT z = 0; z < md; ++z)
+            for (UINT y = 0; y < mh; ++y)
+                std::memcpy(base + (std::size_t(z) * mh + y) * pitch, &texels[(std::size_t(z) * mh + y) * mw],
+                            std::size_t(mw) * 4);
+        up->Unmap(0, nullptr);
+
+        HRESULT close = E_FAIL;
+        const auto res = run(close, [&](ID3D12GraphicsCommandList* list) {
+            const auto to_dst = transition(tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1, &to_dst);
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = up.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint = {0, {format, mw, mh, md, pitch}};
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = tex;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = mip;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            const auto back = transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->ResourceBarrier(1, &back);
+        });
+        return close == S_OK && res == leonida::ReplayResult::success;
+    }
 };
+
+#ifdef LEONIDA_TEST_CS_TEXTURE3D_UAV_SPV
+bool read_spirv(const char* path, std::vector<std::uint32_t>& out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return false;
+    const auto size = file.tellg();
+    if (size <= 0 || size % 4 != 0) return false;
+    out.resize(std::size_t(size) / 4);
+    file.seekg(0);
+    return bool(file.read(reinterpret_cast<char*>(out.data()), size));
+}
+
+// cs_texture3d_uav.comp's push constants.
+struct DispatchParams {
+    std::uint32_t tsharp[8];
+    std::uint32_t width, height, depth, tag;
+};
+
+// Runs cs_texture3d_uav once per entry of params on set 0, in that order, with a barrier between dispatches.
+bool run_dispatches(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSetLayout set0_layout,
+                    const std::vector<DispatchParams>& params) {
+    std::vector<std::uint32_t> code;
+    if (!read_spirv(LEONIDA_TEST_CS_TEXTURE3D_UAV_SPV, code)) return false;
+    const auto create_layout = d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout");
+    const auto destroy_layout = d.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    const auto create_mod = d.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+    const auto destroy_mod = d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    const auto create_pipe = d.fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+    const auto destroy_pipe = d.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+
+    VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto cleanup = [&](bool ok) {
+        if (pipeline) destroy_pipe(d.device, pipeline, nullptr);
+        if (module) destroy_mod(d.device, module, nullptr);
+        if (pipe_layout) destroy_layout(d.device, pipe_layout, nullptr);
+        return ok;
+    };
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DispatchParams)};
+    VkPipelineLayoutCreateInfo pl_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl_info.setLayoutCount = 1;
+    pl_info.pSetLayouts = &set0_layout;
+    pl_info.pushConstantRangeCount = 1;
+    pl_info.pPushConstantRanges = &range;
+    if (create_layout(d.device, &pl_info, nullptr, &pipe_layout) != VK_SUCCESS) return cleanup(false);
+    VkShaderModuleCreateInfo mod_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mod_info.codeSize = code.size() * sizeof(std::uint32_t);
+    mod_info.pCode = code.data();
+    if (create_mod(d.device, &mod_info, nullptr, &module) != VK_SUCCESS) return cleanup(false);
+    VkComputePipelineCreateInfo pipe_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipe_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    pipe_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipe_info.stage.module = module;
+    pipe_info.stage.pName = "main";
+    pipe_info.layout = pipe_layout;
+    if (create_pipe(d.device, VK_NULL_HANDLE, 1, &pipe_info, nullptr, &pipeline) != VK_SUCCESS) return cleanup(false);
+
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        const auto bind_pipe = d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
+        const auto bind_sets = d.fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets");
+        const auto push = d.fn<PFN_vkCmdPushConstants>("vkCmdPushConstants");
+        const auto dispatch = d.fn<PFN_vkCmdDispatch>("vkCmdDispatch");
+        const auto barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+        bind_pipe(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        bind_sets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_layout, 0, 1, &set0, 0, nullptr);
+        VkMemoryBarrier mem{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mem.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        for (const auto& p : params) {
+            push(cb, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+            dispatch(cb, 1, 1, 1);  // 4x4x4 invocations cover mip 0 of the 4x4x4 volume
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem, 0,
+                    nullptr, 0, nullptr);
+        }
+        return true;
+    });
+    return cleanup(ok);
+}
+#endif
 
 D3D12_RESOURCE_DESC tex3d_desc(DXGI_FORMAT format, UINT width, UINT height, UINT16 depth, UINT16 mips,
                                D3D12_RESOURCE_FLAGS flags) {
@@ -182,6 +314,10 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.bindless = d.bindless;
+        info.bindless_partially_bound = d.partially_bound;
+        info.image_view_min_lod = d.image_view_min_lod;
+        info.host_image_copy = d.host_image_copy;
 
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
@@ -349,6 +485,90 @@ int main() {
         h.poison(5);
         device->CreateUnorderedAccessView(readonly_vol.p, nullptr, &uav3d, h.slot(5));
         EXPECT(h.null_at(5));
+
+        // 5. A compute shader reads and writes the views through set 0's 3D storage bindings: a null-desc UAV of an
+        //    R32_UINT 4x4x4 volume with 2 mips (mip 0, Z slices 0-3) and an explicit TEXTURE3D UAV of its mip 1
+        //    (2x2x2, WSize = UINT_MAX). Each texel starts at a distinct value and ends at that value + delta(x, y, z)
+        //    (cs_texture3d_uav.comp), so a view of the wrong mip, slice or binding, or a null view, which the
+        //    shader's lookup turns into the 1x1 fallback, leaves texels at their start or changes the other mip.
+#ifdef LEONIDA_TEST_CS_TEXTURE3D_UAV_SPV
+        if (d.bindless) {
+            Ref<ID3D12Resource> rw = h.committed(
+                tex3d_desc(DXGI_FORMAT_R32_UINT, 4, 4, 4, 2, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            EXPECT(rw.p);
+            const auto start = [](UINT mip, UINT x, UINT y, UINT z) {
+                return 0x40000000u + (mip << 24) + (z << 16) + (y << 8) + x * 0x11u;
+            };
+            const auto delta = [](std::uint32_t tag, UINT x, UINT y, UINT z) {
+                return tag + (z << 16) + (y << 8) + x;
+            };
+            const std::uint32_t tags[2] = {0x01000000u, 0x0a000000u};
+            for (UINT mip = 0; mip < 2; ++mip) {
+                const UINT n = 4u >> mip;
+                std::vector<std::uint32_t> texels;
+                for (UINT z = 0; z < n; ++z)
+                    for (UINT y = 0; y < n; ++y)
+                        for (UINT x = 0; x < n; ++x) texels.push_back(start(mip, x, y, z));
+                EXPECT(h.upload_3d_mip(rw.p, DXGI_FORMAT_R32_UINT, 4, 4, 4, mip, texels));
+            }
+
+            h.poison(6);
+            device->CreateUnorderedAccessView(rw.p, nullptr, nullptr, h.slot(6));
+            D3D12_UNORDERED_ACCESS_VIEW_DESC mip1{};
+            mip1.Format = DXGI_FORMAT_R32_UINT;
+            mip1.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            mip1.Texture3D = {1, 0, UINT_MAX};
+            h.poison(7);
+            device->CreateUnorderedAccessView(rw.p, nullptr, &mip1, h.slot(7));
+            EXPECT(h.image_at(6, img) && img.type == g::ImageType::image_3d && img.first_mip == 0);
+            EXPECT(h.image_at(7, img) && img.type == g::ImageType::image_3d && img.first_mip == 1);
+
+            // Executing a list runs the device's set-0 flush, which writes the views' storage descriptors and the
+            // hash table; a flush can replace the set, so it is read afterwards.
+            HRESULT flush_close = E_FAIL;
+            EXPECT(h.run(flush_close, [&](ID3D12GraphicsCommandList* list) {
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.UAV.pResource = rw.p;
+                list->ResourceBarrier(1, &uav);
+            }) == leonida::ReplayResult::success && flush_close == S_OK);
+            const VkDescriptorSet set0 = rt::d3d12::bindless_set(device.p);
+            const VkDescriptorSetLayout set0_layout = rt::d3d12::bindless_set_layout(device.p);
+            EXPECT(set0 && set0_layout);
+
+            std::vector<DispatchParams> params(2);
+            for (UINT v = 0; v < 2; ++v) {
+                std::memcpy(params[v].tsharp, h.bytes(6 + v), sizeof(params[v].tsharp));
+                params[v].width = params[v].height = params[v].depth = 4u >> v;
+                params[v].tag = tags[v];
+            }
+            EXPECT(run_dispatches(d, set0, set0_layout, params));
+
+            for (UINT mip = 0; mip < 2; ++mip) {
+                const UINT n = 4u >> mip;
+                EXPECT(h.readback_3d_mip(rw.p, DXGI_FORMAT_R32_UINT, 4, 4, 4, mip, pixels));
+                EXPECT(pixels.size() == std::size_t(n) * n * n);
+                UINT bad = 0;
+                for (UINT z = 0; z < n; ++z)
+                    for (UINT y = 0; y < n; ++y)
+                        for (UINT x = 0; x < n; ++x) {
+                            const std::uint32_t got = pixels[(std::size_t(z) * n + y) * n + x];
+                            const std::uint32_t want = start(mip, x, y, z) + delta(tags[mip], x, y, z);
+                            if (got != want && bad++ < 8)
+                                std::fprintf(stderr, "mip %u texel (%u, %u, %u): got 0x%08x, want 0x%08x\n", mip, x,
+                                             y, z, got, want);
+                        }
+                EXPECT(bad == 0);
+            }
+            std::printf("Compute through 3D storage bindings 7 and 15: 64 texels of mip 0 (Z 0-3) and 8 of mip 1 "
+                        "matched\n");
+        } else {
+            std::printf("No bindless set 0 on this device: the 3D storage dispatch is not run\n");
+        }
+#else
+        std::printf("glslangValidator not found at build time: the 3D storage dispatch is not run\n");
+#endif
     }
 
     if (d.validation_errors()) {
