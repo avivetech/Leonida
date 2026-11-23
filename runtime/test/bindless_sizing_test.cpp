@@ -103,13 +103,30 @@ int main() {
         EXPECT(f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
         EXPECT(f.counts[bindless::sampler_binding] > 2048);  // a full sampler heap and the fallback
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices);
-        EXPECT(storage(f, D::dim_2d_array) == 1024 && storage(f, D::dim_3d) == 256 && storage(f, D::dim_1d) == 256);
-        EXPECT(count(f, D::dim_2d_array) == 1024 && count(f, D::dim_3d) == 256 && count(f, D::dim_1d) == 256);
+        EXPECT(storage(f, D::dim_2d_array) == bindless::max_storage_indices && storage(f, D::dim_3d) == 256 &&
+               storage(f, D::dim_1d) == 256);
+        EXPECT(count(f, D::dim_2d_array) == bindless::max_2d_array_images && count(f, D::dim_3d) == 256 &&
+               count(f, D::dim_1d) == 256);
         EXPECT(f.ms_samples[0] == VK_SAMPLE_COUNT_4_BIT && f.ms_samples[2] == VK_SAMPLE_COUNT_4_BIT);
         EXPECT(storage_consistent(f));
         if (update_after_bind)
-            std::printf("RTX 5070-like: %u 2D images, %u samplers, %u storage indices in 2D, %u descriptors\n",
-                        count(f, D::dim_2d), f.counts[bindless::sampler_binding], storage(f, D::dim_2d), totals(f).all);
+            std::printf("RTX 5070-like: %u 2D images, %u 2D-array images, %u samplers, %u storage indices in 2D, %u descriptors\n",
+                        count(f, D::dim_2d), count(f, D::dim_2d_array), f.counts[bindless::sampler_binding],
+                        storage(f, D::dim_2d), totals(f).all);
+    }
+
+    // Intermediate sampled-image budget: 2D images reach their cap, then 2D-array images grow partially within
+    // headroom and its storage arrays follow without exceeding the 2D-array count.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.v12.maxPerStageDescriptorUpdateAfterBindSampledImages = 72000;
+        BindlessFeatures f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images);
+        EXPECT(count(f, D::dim_2d_array) > 1024 && count(f, D::dim_2d_array) < bindless::max_2d_array_images);
+        EXPECT(totals(f).sampled + bindless::growth_headroom <= 72000);
+        EXPECT(storage(f, D::dim_2d_array) == std::min(bindless::max_storage_indices, count(f, D::dim_2d_array)));
+        EXPECT(storage_consistent(f));
     }
 
     // At today's sizes exactly (5632 sampled images, 1024 samplers, 3584 storage images): today's set, no MS pairs.

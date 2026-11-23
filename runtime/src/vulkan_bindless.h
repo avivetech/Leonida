@@ -196,8 +196,9 @@ struct SetLayout {
 };
 
 // What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
-// 3-6 MiB (93793 descriptors on an RTX 5070).
+// 3-7 MiB (110177 descriptors on an RTX 5070).
 inline constexpr std::uint32_t max_2d_images = 65536;
+inline constexpr std::uint32_t max_2d_array_images = 8192;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -206,14 +207,15 @@ inline constexpr std::uint32_t reserved_samplers = 64;
 // Growth leaves this many descriptors of each limit to the other sets of a pipeline layout.
 inline constexpr std::uint32_t growth_headroom = 64;
 
-// Sizes the 2D image, sampler and storage arrays from the device's limits: the update-after-bind ones with
-// features.update_after_bind, the plain ones otherwise. Every binding is visible to every stage, so the per-stage
+// Sizes the 2D image, 2D-array image, sampler and storage arrays from the device's limits: the update-after-bind ones
+// with features.update_after_bind, the plain ones otherwise. Every binding is visible to every stage, so the per-stage
 // limits apply to the whole set; fragment outputs count as stage resources (D3D12 allows eight render targets) and
 // standalone samplers do not, though they count in an update-after-bind pool.
 //   1. The default counts, or as much of them as the device holds: samplers, then storage, then 2D images.
 //   2. The MS pairs that fit beside them (limit_ms_bindings, which may turn classes off).
-//   3. Growth towards the maximums above, in the same order, within maxPerSetDescriptors. That limit only says
-//      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
+//   3. Growth towards the maximums above (samplers, 2D images, 2D-array images, then storage), within
+//      maxPerSetDescriptors. That limit only says what is sure to work (vkGetDescriptorSetLayoutSupport may allow
+//      more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
 // storage view an index past the sampled array. The other bindings keep their default counts.
 // layout_supported, when given, answers vkGetDescriptorSetLayoutSupport for set 0 at the counts in its argument:
@@ -243,11 +245,13 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
+    std::uint32_t images_2d_array = bindings[sampled_binding(ImageDimension::dim_2d_array)].count;
     // Cap 2D storage by 2D images everywhere except step 1's initial storage pass, where 2D images are still 1.
     // Otherwise 2D images, non-2D storage, MS selection, set_limit and layout_supported are charged for 2D storage
     // slots that the final cap discards.
     const auto apply = [&](bool cap_2d) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        counts[sampled_binding(ImageDimension::dim_2d_array)] = images_2d_array;
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
@@ -307,6 +311,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
         limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    grow(images_2d_array, std::max(images_2d_array, max_2d_array_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
     apply(true);
     return full;
