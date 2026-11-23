@@ -4299,6 +4299,11 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
+        if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0')
+            std::fprintf(stderr, "[red] pso %llx vs=%s ps=%s rt0fmt=%u nrt=%u\n", (unsigned long long)id(),
+                         stages[0].entry ? stages[0].entry->name.c_str() : "-",
+                         stages[2].entry ? stages[2].entry->name.c_str() : "-", unsigned(desc.RTVFormats[0]),
+                         unsigned(desc.NumRenderTargets));
         device_.context->add_graphics_pipeline(id(), graphics_);
         registered_ = true;
         is_graphics_ = true;

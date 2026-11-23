@@ -292,6 +292,10 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         timing = pacer_.present_timing(token);
         tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
     }
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0' && (presents_ < 64 || !(presents_ & 255)))
+        std::fprintf(stderr, "[red] present res=%llx fmt=%u %llux%u rect=%d\n",
+                     (unsigned long long)reinterpret_cast<std::uintptr_t>(resource), unsigned(desc.Format),
+                     (unsigned long long)desc.Width, desc.Height, rect ? 1 : 0);
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     pacer_.commit_present_token(token, plane_count,
