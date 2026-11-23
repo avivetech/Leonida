@@ -110,6 +110,25 @@ const char* const kNotHResult[] = {
 };
 const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
 
+static bool is_audio_hal_hresult(const std::string& dll, const std::string& name) {
+    if (dll == "chad.dll") {
+        // All five XDsp* functions return HRESULT (GDK XDspAudio reference).
+        if (starts_with(name, "XDsp")) return true;
+    } else if (dll == "xapu.dll") {
+        // XApuConnect/DequeueResult/Disconnect/EnqueueCommand return HRESULT;
+        // XApuGetResultCount returns uint32_t.
+        if (name != "XApuGetResultCount" && starts_with(name, "XApu")) return true;
+    } else if (dll == "acphal.dll") {
+        // AcpHalAllocateShapeContexts, AcpHalCreate, AcpHalReleaseShapeContexts,
+        // ApuAlloc, ApuCreateHeap return HRESULT.  ApuFree, ApuIsVirtualAddressValid,
+        // ApuMapApuAddress and ApuMapVirtualAddress return other types.
+        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
+            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
+            name == "ApuCreateHeap") return true;
+    }
+    return false;
+}
+
 ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
@@ -126,6 +145,8 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "GameInputCreate") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
+    } else if (is_audio_hal_hresult(dll, name)) {
+        return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)

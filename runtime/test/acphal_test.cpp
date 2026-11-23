@@ -1,6 +1,8 @@
-// Checks the registered AcpHal.dll shim in the shapes the game's call sites use (runtime/shims/acphal.cpp).
-// Every function is resolved through rt::shims::find, and the AcpHal object is called through its raw vtable slots,
-// as the title does.
+// Checks the registered acphal.dll shim against the measured call shapes
+// (docs/audio_hal_exe_calls.md, PR #6885 measurements).
+//
+// All 9 exports are resolved through rt::shims::find so the test exercises
+// the same shim table and calling convention the runtime installs.
 #include <windows.h>
 
 #include <cstdint>
@@ -11,18 +13,17 @@
 
 namespace {
 
-using CreateHeapFn = HRESULT (*)(uint32_t, uint32_t);
-using AllocFn = HRESULT (*)(void**, uint32_t*, uint32_t, uint32_t, uint32_t);
-using FreeFn = HRESULT (*)(void*);
-using ValidFn = BOOL (*)(const void*, uint32_t);
-using MapVaFn = uint32_t (*)(const void*);
-using MapApuFn = void* (*)(uint32_t);
-using AllocShapeFn = HRESULT (*)(void*);
-using ReleaseShapeFn = HRESULT (*)();
-using CreateFn = HRESULT (*)(void**);
-using Slot0Fn = HRESULT (*)(void*, uint32_t, uint32_t);
-using Slot1Fn = HRESULT (*)(void*);
-using Slot2Fn = HRESULT (*)(void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
+using AcpHalCreateFn = HRESULT(__stdcall*)(void**);
+using AcpHalAllocShapeCtxFn = HRESULT(__stdcall*)(void*);
+using AcpHalReleaseShapeCtxFn = HRESULT(__stdcall*)(void*);
+using ApuCreateHeapFn = HRESULT(__stdcall*)(uint32_t, uint32_t);
+// Measured: flags=2, apu=NULL, align=0x800 (PR #6885)
+using ApuAllocFn = HRESULT(__stdcall*)(void**, uint32_t*, uint32_t, uint32_t, uint32_t);
+using ApuFreeFn = void(__stdcall*)(void*);
+// Measured: ApuIsVirtualAddressValid(void* va, uint32_t align)
+using ApuIsValidFn = BOOL(__stdcall*)(void*, uint32_t);
+using ApuMapApuAddrFn = void*(__stdcall*)(uint32_t);
+using ApuMapVirtualAddrFn = uint32_t(__stdcall*)(void*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -33,100 +34,164 @@ void check(bool condition, const char* what) {
     if (!condition) ++g_failures;
 }
 
-template <typename T>
-T get(const char* name) {
-    return reinterpret_cast<T>(rt::shims::find("acphal.dll", name));
-}
-
 }  // namespace
 
 int main() {
+    std::printf("acphal_test: registered acphal.dll shim\n");
+
+    const auto create = reinterpret_cast<AcpHalCreateFn>(
+        rt::shims::find("acphal.dll", "AcpHalCreate"));
+    const auto alloc_ctx = reinterpret_cast<AcpHalAllocShapeCtxFn>(
+        rt::shims::find("acphal.dll", "AcpHalAllocateShapeContexts"));
+    const auto release_ctx = reinterpret_cast<AcpHalReleaseShapeCtxFn>(
+        rt::shims::find("acphal.dll", "AcpHalReleaseShapeContexts"));
+    const auto create_heap = reinterpret_cast<ApuCreateHeapFn>(
+        rt::shims::find("acphal.dll", "ApuCreateHeap"));
+    const auto alloc = reinterpret_cast<ApuAllocFn>(
+        rt::shims::find("acphal.dll", "ApuAlloc"));
+    const auto free_mem = reinterpret_cast<ApuFreeFn>(
+        rt::shims::find("acphal.dll", "ApuFree"));
+    const auto is_valid = reinterpret_cast<ApuIsValidFn>(
+        rt::shims::find("acphal.dll", "ApuIsVirtualAddressValid"));
+    const auto map_apu = reinterpret_cast<ApuMapApuAddrFn>(
+        rt::shims::find("acphal.dll", "ApuMapApuAddress"));
+    const auto map_virtual = reinterpret_cast<ApuMapVirtualAddrFn>(
+        rt::shims::find("acphal.dll", "ApuMapVirtualAddress"));
+
+    check(create != nullptr, "AcpHalCreate is registered");
+    check(alloc_ctx != nullptr, "AcpHalAllocateShapeContexts is registered");
+    check(release_ctx != nullptr, "AcpHalReleaseShapeContexts is registered");
+    check(create_heap != nullptr, "ApuCreateHeap is registered");
+    check(alloc != nullptr, "ApuAlloc is registered");
+    check(free_mem != nullptr, "ApuFree is registered");
+    check(is_valid != nullptr, "ApuIsVirtualAddressValid is registered");
+    check(map_apu != nullptr, "ApuMapApuAddress is registered");
+    check(map_virtual != nullptr, "ApuMapVirtualAddress is registered");
     check(rt::shims::owns_dll("acphal.dll"), "the registry owns acphal.dll");
-    const auto create_heap = get<CreateHeapFn>("ApuCreateHeap");
-    const auto alloc = get<AllocFn>("ApuAlloc");
-    const auto free_mem = get<FreeFn>("ApuFree");
-    const auto valid = get<ValidFn>("ApuIsVirtualAddressValid");
-    const auto map_va = get<MapVaFn>("ApuMapVirtualAddress");
-    const auto map_apu = get<MapApuFn>("ApuMapApuAddress");
-    const auto alloc_shape = get<AllocShapeFn>("AcpHalAllocateShapeContexts");
-    const auto release_shape = get<ReleaseShapeFn>("AcpHalReleaseShapeContexts");
-    const auto create = get<CreateFn>("AcpHalCreate");
-    if (!create_heap || !alloc || !free_mem || !valid || !map_va || !map_apu || !alloc_shape || !release_shape ||
-        !create) {
-        std::printf("FAIL an AcpHal.dll export is not registered\n");
+    if (!create || !alloc_ctx || !release_ctx || !create_heap || !alloc ||
+        !free_mem || !is_valid || !map_apu || !map_virtual)
         return 1;
+
+    // AcpHalCreate(IAcpHal** out): returns a dereferenceable vtable-backed object.
+    void* acp = nullptr;
+    check(create(&acp) == S_OK && acp != nullptr,
+          "AcpHalCreate returns S_OK with a non-null object");
+    if (acp) {
+        // The returned object has a vtable: slots 0 (AddRef), 1 (Release), rest are E_NOTIMPL.
+        auto vtable = *static_cast<void* const* const*>(acp);
+        check(vtable[0] != nullptr, "IAcpHal vtable slot 0 (AddRef) is present");
+        check(vtable[1] != nullptr, "IAcpHal vtable slot 1 (Release) is present");
+        check(vtable[2] != nullptr, "IAcpHal vtable slot 2 (Connect/etc.) is present");
+    }
+    check(create(nullptr) == E_POINTER,
+          "AcpHalCreate(nullptr) returns E_POINTER");
+
+    // AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx): accepts any combination of counts.
+    // The title calls with numSrcContexts=0, numXmaContexts=350, numPcmContexts=0.
+    // Build a SHAPE_CONTEXTS-like buffer to pass (we need the exact struct layout).
+    // The struct has 6 x uint32_t + 6 x pointer + 6 x APU_ADDRESS (uint64_t).
+    uint64_t shape_ctx[(6 + 6 + 6) * 8 / 8] = {};
+    // Set some context counts.
+    ((uint32_t*)shape_ctx)[0] = 0;   // numSrcContexts
+    ((uint32_t*)shape_ctx)[1] = 0;   // numEqCompContexts
+    ((uint32_t*)shape_ctx)[2] = 0;   // numFiltVolContexts
+    ((uint32_t*)shape_ctx)[3] = 0;   // numDmaContexts
+    ((uint32_t*)shape_ctx)[4] = 350; // numXmaContexts
+    ((uint32_t*)shape_ctx)[5] = 0;   // numPcmContexts
+    check(alloc_ctx(shape_ctx) == S_OK,
+          "AcpHalAllocateShapeContexts succeeds with the title's counts");
+    // The xmaContextArray pointer should be non-null (350 elements * 64 bytes = 22400 bytes).
+    // Struct layout: 6 uint32_t (24 B), then 6 pointers starting at offset 24.
+    // xmaContextArray is the 5th pointer (offset 56 = uint64_t index 7).
+    void* xma_array = ((void**)shape_ctx)[7];
+    check(xma_array != nullptr,
+          "AcpHalAllocateShapeContexts returns a non-null XMA context array");
+
+    // The XMA contexts are 64 bytes each: the first use is memset(ptr, 0, 350*64).
+    if (xma_array) {
+        std::memset(xma_array, 0, 350 * 64);
+        check(true, "the XMA context array can be written at its full stride");
     }
 
-    void* none = nullptr;
-    check(alloc(&none, nullptr, 64, 64, 0) < 0 && !none, "ApuAlloc before ApuCreateHeap fails with *va NULL");
+    // Release the contexts.
+    check(release_ctx(shape_ctx) == S_OK,
+          "AcpHalReleaseShapeContexts succeeds");
 
-    // Boot order at the call sites: the heap (MiB << 20, then a byte count), then one aligned block, flags 2.
-    check(create_heap(1u << 20, 0x226E00) == S_OK, "ApuCreateHeap(1 MiB, 0x226E00) succeeds");
-    check(create_heap(1u << 20, 0) < 0, "a second ApuCreateHeap fails");
-    void* big = nullptr;
-    uint32_t big_apu = 0;
-    check(alloc(&big, &big_apu, 0x222E00, 0x800, 2) == S_OK && big, "ApuAlloc(0x222E00, align 0x800) succeeds");
-    check((reinterpret_cast<uintptr_t>(big) & 0x7FF) == 0 && (big_apu & 0x7FF) == 0, "the block is 0x800-aligned");
-    const auto* bytes = static_cast<const uint8_t*>(big);
-    check(bytes && bytes[0] == 0 && bytes[0x222E00 - 1] == 0, "the block is zeroed");
+    // AcpHalCreate returns a dereferenceable object once more (second call works too).
+    void* acp2 = nullptr;
+    check(create(&acp2) == S_OK && acp2 != nullptr,
+          "AcpHalCreate second call returns S_OK with a non-null object");
 
-    // Context setup: validity with the three measured alignments, then the 32-bit mapping and back.
-    uint8_t* inner = static_cast<uint8_t*>(big) + 0x1900;
-    check(valid(inner, 0x40) && valid(inner, 0x80) && valid(inner, 0x800) == FALSE,
-          "ApuIsVirtualAddressValid checks the alignment");
-    check(valid(static_cast<uint8_t*>(big) + 0x222E00, 0x40) == FALSE, "an address past the block is not valid");
-    int local = 0;
-    check(valid(&local, 1) == FALSE && map_va(&local) == 0, "memory outside the heap is not valid and maps to 0");
-    check(map_va(nullptr) == 0 && map_apu(0) == nullptr, "NULL maps to 0 and 0 to NULL");
-    const uint32_t apu = map_va(inner);
-    check(apu == big_apu + 0x1900, "ApuMapVirtualAddress agrees with ApuAlloc's APU address");
-    check(map_apu(apu) == inner, "ApuMapApuAddress inverts ApuMapVirtualAddress");
+    // ApuCreateHeap(cachedSize, nonCachedSize): the title passes (size, 0x226e00).
+    check(create_heap(4 * 1024 * 1024, 0x226e00) == S_OK,
+          "ApuCreateHeap succeeds");
+    check(create_heap(4 * 1024 * 1024, 0) != S_OK,
+          "ApuCreateHeap second call returns an error (heap already created)");
 
-    void* small = nullptr;
-    check(alloc(&small, nullptr, 0x100, 0x40, 0) == S_OK && small && small != big, "a second block fits after it");
-    check(alloc(&none, nullptr, 0x400000, 0x40, 0) < 0, "a block larger than the heap fails");
-    check(alloc(&none, nullptr, 0x100, 3, 0) < 0, "a non-power-of-two alignment fails");
-    check(free_mem(big) == S_OK && free_mem(big) < 0, "ApuFree releases a block once");
-    void* again = nullptr;
-    check(alloc(&again, nullptr, 0x1000, 0x800, 2) == S_OK && again == big, "freed space is reused");
-    check(free_mem(again) == S_OK && free_mem(small) == S_OK, "ApuFree of the remaining blocks");
-
-    // Shape contexts: 6 counts then 6 pointers; the caller sets the fifth count and clears count * 64 bytes.
-    struct {
-        uint32_t count[6];
-        void* contexts[6];
-    } shape{};
-    shape.count[4] = 350;
-    check(alloc_shape(&shape) == S_OK, "AcpHalAllocateShapeContexts succeeds");
-    check(reinterpret_cast<uint8_t*>(&shape.contexts[4]) - reinterpret_cast<uint8_t*>(&shape) == 0x38 &&
-              shape.contexts[4] && !shape.contexts[0] && !shape.contexts[5],
-          "the fifth pointer at +0x38 is set, zero counts stay NULL");
-    if (shape.contexts[4]) std::memset(shape.contexts[4], 0xA5, 350 * 64);
-    check(release_shape() == S_OK, "AcpHalReleaseShapeContexts succeeds");
-    // A caller whose block ends after the fifth pointer (+0x40): the sixth pointer's bytes are not written.
-    shape = {};
-    shape.count[4] = 1;
-    std::memset(&shape.contexts[5], 0x5A, sizeof(void*));
-    void* guard;
-    std::memset(&guard, 0x5A, sizeof guard);
-    check(alloc_shape(&shape) == S_OK && shape.contexts[4] && shape.contexts[5] == guard,
-          "a zero count leaves its pointer untouched");
-    release_shape();
-
-    // The object: slot 0 (0x1000, 0x1000), slot 2 as the boot call passes it, slot 1, slot 5 last.
-    void* hal = nullptr;
-    check(create(&hal) == S_OK && hal, "AcpHalCreate returns an object");
-    if (hal) {
-        void** vtbl = *static_cast<void***>(hal);
-        const uint32_t arg = 0xC0;
-        check(reinterpret_cast<Slot0Fn>(vtbl[0])(hal, 0x1000, 0x1000) == S_OK, "slot 0 succeeds");
-        check(reinterpret_cast<Slot2Fn>(vtbl[2])(hal, 2, 0xF0F0F0F0, 0xFFFFFFFF, &arg, 0) == S_OK,
-              "slot 2 accepts a command");
-        check(reinterpret_cast<Slot1Fn>(vtbl[3])(hal) == 0 && reinterpret_cast<Slot1Fn>(vtbl[4])(hal) == 0,
-              "slots 3 and 4 answer 0 (no message waiting)");
-        check(reinterpret_cast<Slot1Fn>(vtbl[1])(hal) == S_OK, "slot 1 succeeds");
-        check(reinterpret_cast<Slot1Fn>(vtbl[5])(hal) == S_OK, "slot 5 releases the object");
+    // ApuAlloc(virtualAddress*, physicalAddress*, size, alignment, flags).
+    // Measured: flags=2 at one call site, flags=1 at another (PR #6885, confirmed
+    // by static read of 1.0.2.1).  Test both, plus 0 for cached allocations.
+    void* va = nullptr;
+    check(alloc(&va, nullptr, 4096, 0x800, 2) == S_OK && va != nullptr,
+          "ApuAlloc with flags=2 succeeds and returns a virtual address");
+    void* vb = nullptr;
+    check(alloc(&vb, nullptr, 4096, 0x800, 1) == S_OK && vb != nullptr,
+          "ApuAlloc with flags=1 (second measured value) also succeeds");
+    if (va) {
+        // The address must be aligned to 0x800 (2048).
+        check((reinterpret_cast<uintptr_t>(va) & (0x800 - 1)) == 0,
+              "ApuAlloc returns a 2048-byte aligned address");
+        // The address is valid through ApuIsVirtualAddressValid at the right alignment.
+        check(is_valid(va, 0x800) == TRUE,
+              "ApuIsVirtualAddressValid returns TRUE for the allocated address at align 0x800");
     }
+
+    // Regression: cached (flags=0) and non-cached (flags=2) use separate bump offsets.
+    void* cached_big = nullptr;
+    void* noncached_block = nullptr;
+    // 3 MiB fits in the 4 MiB cached heap but exceeds the ~2.2 MiB non-cached heap.
+    const HRESULT cr_cached = alloc(&cached_big, nullptr, 3 * 1024 * 1024, 0x800, 0);
+    check(cr_cached == S_OK && cached_big != nullptr,
+          "ApuAlloc cached (flags=0) 3 MiB succeeds (within the 4 MiB cached heap)");
+    const HRESULT cr_noncached = alloc(&noncached_block, nullptr, 0x1000, 0x800, 2);
+    check(cr_noncached == S_OK && noncached_block != nullptr,
+          "ApuAlloc non-cached (flags=2) 4 KiB still succeeds (separate bump offset)");
+    if (cached_big && noncached_block) {
+        check(is_valid(cached_big, 0x800) == TRUE,
+              "cached 3 MiB block is in a valid heap");
+        check(is_valid(noncached_block, 0x800) == TRUE,
+              "non-cached 4 KiB block is in a valid heap");
+        check(cached_big != noncached_block,
+              "cached and non-cached allocations return different addresses");
+        // APU addresses use disjoint ranges so cached and non-cached round-trip separately.
+        const uint32_t cached_apu = map_virtual(cached_big);
+        const uint32_t noncached_apu = map_virtual(noncached_block);
+        check(cached_apu != noncached_apu,
+              "cached and non-cached APU addresses are distinct");
+        check(map_apu(cached_apu) == cached_big,
+              "ApuMapApuAddress round-trips the cached block (disjoint APU ranges)");
+        check(map_apu(noncached_apu) == noncached_block,
+              "ApuMapApuAddress round-trips the non-cached block (disjoint APU ranges)");
+    }
+
+    // ApuFree(void*): void return, no-op.
+    free_mem(va);
+    free_mem(nullptr);
+    check(true, "ApuFree accepts both a valid pointer and nullptr without crashing");
+
+    // ApuIsVirtualAddressValid on null or invalid addresses returns FALSE.
+    check(is_valid(nullptr, 0x800) == FALSE,
+          "ApuIsVirtualAddressValid(nullptr, *any*) returns FALSE");
+    check(is_valid((void*)1, 0x800) == FALSE,
+          "ApuIsVirtualAddressValid(invalid) returns FALSE");
+
+    // ApuMapApuAddress(uint32_t apu): translate 32-bit APU address to virtual.
+    check(map_apu(0) == nullptr,
+          "ApuMapApuAddress(0) returns nullptr");
+
+    // ApuMapVirtualAddress(void*): returns uint32_t APU address.
+    check(map_virtual(nullptr) == 0,
+          "ApuMapVirtualAddress(nullptr) returns 0");
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

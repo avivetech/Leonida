@@ -111,6 +111,9 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/acphal.cpp
     shims/xapu_chad.cpp
     shims/xg_xs.cpp
+    shims/chad.cpp
+    shims/xapu.cpp
+    shims/acphal.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/d3d12_xs_pso_stream.cpp
@@ -274,6 +277,39 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
+
+  # xapu shim ABI test: resolves the registered xapu.dll exports through the registry.
+  add_executable(xapu_test
+    test/xapu_test.cpp
+    shims/xapu.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xapu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xapu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xapu_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xapu_test PRIVATE /OPT:NOREF)
+
+  # chad shim ABI test: resolves the registered chad.dll exports through the registry.
+  add_executable(chad_test
+    test/chad_test.cpp
+    shims/chad.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(chad_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(chad_test PRIVATE /OPT:NOREF)
+
+  # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
+  add_executable(acphal_test
+    test/acphal_test.cpp
+    shims/acphal.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -1231,6 +1267,15 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
+  endif()
+  if(WIN32 AND TARGET xapu_test)
+    add_test(NAME xapu COMMAND xapu_test)
+  endif()
+  if(WIN32 AND TARGET chad_test)
+    add_test(NAME chad COMMAND chad_test)
+  endif()
+  if(WIN32 AND TARGET acphal_test)
+    add_test(NAME acphal COMMAND acphal_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
