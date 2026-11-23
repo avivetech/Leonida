@@ -3992,6 +3992,7 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 // `state` is 0xFFFFFFFF, which is no PC state. The resource is a buffer on those pages, made by the handler the
 // device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
 // ROW_MAJOR, as slot 76 does. g_placed_at_va is declared above, with the committed resources that use it too.
+std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t state, const IID* riid, void** out) {
     note_slot(133);
@@ -4018,6 +4019,16 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      "state=0x%x -> a buffer on the title's pages\n",
                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
                      xbox_flags, state);
+    }
+    // The buffer's pages are committed before the handler walks them (set_placed_at_va_pages_hook).
+    const PlacedAtVaPagesHook pages = g_placed_at_va_pages.load(std::memory_order_acquire);
+    if (pages && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && pc_desc.Width &&
+        !pages(va, static_cast<std::size_t>(pc_desc.Width))) {
+        static std::atomic<bool> refused{false};
+        if (!refused.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 133: committing the pages of va=%p width=%llu failed (error %lu)\n",
+                         va, static_cast<unsigned long long>(pc_desc.Width), GetLastError());
+        }
     }
     const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
     if (FAILED(hr)) {
@@ -4710,6 +4721,10 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
+    g_placed_at_va_pages.store(hook, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

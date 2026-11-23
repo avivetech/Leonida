@@ -188,6 +188,14 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
+// rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but
+// not written yet is still reserved, and the handler's import refuses reserved pages (it would answer with its
+// fallback buffer, which the title's writes never reach). A false return is logged once and the handler is still
+// called. With none registered nothing is done.
+using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
+void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
 // console's struct-return form), 27 and 53 (committed resources, memory through the title's XMem hook),
