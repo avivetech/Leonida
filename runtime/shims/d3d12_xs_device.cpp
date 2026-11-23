@@ -1414,6 +1414,7 @@ PresentState* present_state_for(DeviceProxy* device) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
         return state;
     }
+    ShowWindow(state->window, SW_SHOWNOACTIVATE);
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
