@@ -816,21 +816,135 @@ struct DeviceState {
         std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
     }
     void refresh_shadows() {
-        std::lock_guard lock(shadow_mutex);
-        for (const Shadow& s : shadows) {
-            if (!shadow_sizes_logged.insert(s.size).second) {
+        {
+            std::lock_guard lock(shadow_mutex);
+            for (const Shadow& s : shadows) {
+                if (!shadow_sizes_logged.insert(s.size).second) {
+                    copy_title_pages(s.mapped, s.pages, s.size);
+                    continue;
+                }
+                const auto start = std::chrono::steady_clock::now();
                 copy_title_pages(s.mapped, s.pages, s.size);
-                continue;
+                const double ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
+                                     "%.3f ms (%.0f MiB/s), paid at every submission\n",
+                             static_cast<unsigned long long>(s.size / 1024), ms,
+                             ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
             }
-            const auto start = std::chrono::steady_clock::now();
-            copy_title_pages(s.mapped, s.pages, s.size);
-            const double ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
-                                 "%.3f ms (%.0f MiB/s), paid at every submission\n",
-                         static_cast<unsigned long long>(s.size / 1024), ms,
-                         ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
         }
+        refresh_linear_textures();
+    }
+
+    // Live linear slot-133 textures (e.g. 4K Bink2 YUV planes decoded on CPU into XMem linear pages): fingerprinted
+    // before each submission and re-uploaded via WriteToSubresource whenever their CPU pages change.
+    struct LinearTexShadow {
+        ID3D12Resource* resource = nullptr;
+        bool (*try_add_ref)(ID3D12Resource*) = nullptr;
+        const std::uint8_t* pages = nullptr;
+        UINT mip_count = 0;
+        UINT width = 0;
+        UINT height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_REQ_MIP_LEVELS> footprints{};
+        UINT64 total_bytes = 0;
+        std::uint64_t last_hash = 0;
+        bool ever_uploaded = false;
+    };
+    std::mutex linear_shadow_mutex;
+    std::vector<LinearTexShadow> linear_shadows;
+
+    static bool pages_committed_readable(const std::uint8_t* pages, UINT64 size) {
+        const auto base = reinterpret_cast<std::uintptr_t>(pages);
+        if (!base || !size || size > UINTPTR_MAX - base) return false;
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        for (auto cursor = base; cursor < base + size;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) ||
+                region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+                !(region.Protect & kReadable))
+                return false;
+            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            if (end <= cursor) return false;
+            cursor = end;
+        }
+        return true;
+    }
+
+    static std::uint64_t sample_linear_hash(const std::uint8_t* pages, UINT64 size, bool& nonzero) {
+        nonzero = false;
+        if (!pages || !size) return 0;
+        std::uint64_t h = 14695981039346656037ull;
+        constexpr UINT64 kSamples = 256;
+        const UINT64 step = size > kSamples * 8 ? size / kSamples : 8;
+        for (UINT64 off = 0; off + 8 <= size; off += step) {
+            std::uint64_t w = 0;
+            std::memcpy(&w, pages + off, sizeof(w));
+            if (w) nonzero = true;
+            h ^= w;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    void add_linear_shadow(const LinearTexShadow& s) {
+        std::lock_guard lock(linear_shadow_mutex);
+        linear_shadows.push_back(s);
+    }
+
+    void remove_linear_shadow(ID3D12Resource* resource) {
+        std::lock_guard lock(linear_shadow_mutex);
+        std::erase_if(linear_shadows, [resource](const LinearTexShadow& s) { return s.resource == resource; });
+    }
+
+    void refresh_linear_textures() {
+        static thread_local bool in_refresh = false;
+        if (in_refresh) return;
+        std::vector<LinearTexShadow> work;
+        {
+            std::lock_guard lock(linear_shadow_mutex);
+            if (linear_shadows.empty()) return;
+            work.reserve(linear_shadows.size());
+            for (const LinearTexShadow& s : linear_shadows) {
+                if (s.resource && s.try_add_ref && s.try_add_ref(s.resource)) work.push_back(s);
+            }
+        }
+        in_refresh = true;
+        for (const LinearTexShadow& s : work) {
+            if (pages_committed_readable(s.pages, s.total_bytes)) {
+                bool nonzero = false;
+                const std::uint64_t h = sample_linear_hash(s.pages, s.total_bytes, nonzero);
+                if (!s.ever_uploaded || h != s.last_hash) {
+                    HRESULT hr = S_OK;
+                    for (UINT mip = 0; mip < s.mip_count && SUCCEEDED(hr); ++mip) {
+                        const auto& fp = s.footprints[mip];
+                        hr = s.resource->WriteToSubresource(mip, nullptr, s.pages + fp.Offset, fp.Footprint.RowPitch, 0);
+                    }
+                    if (SUCCEEDED(hr)) {
+                        std::lock_guard lock(linear_shadow_mutex);
+                        for (LinearTexShadow& live : linear_shadows) {
+                            if (live.resource == s.resource) {
+                                live.last_hash = h;
+                                live.ever_uploaded = true;
+                                break;
+                            }
+                        }
+                        if (nonzero) {
+                            static std::atomic<int> nz_logged{0};
+                            const int n = nz_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (n <= 8 || !(n & (n - 1)))
+                                std::fprintf(stderr,
+                                             "[rt] d3d12: uploaded live linear slot-133 texture #%d (%ux%u fmt=%u from VA %p, nonzero!)\n",
+                                             n, s.width, s.height, static_cast<unsigned>(s.format),
+                                             static_cast<const void*>(s.pages));
+                        }
+                    }
+                }
+            }
+            s.resource->Release();
+        }
+        in_refresh = false;
     }
 
     // Windows of the title's own memory in the GPU address arena (src/title_va_alias.h, docs/d3d12_vulkan.md
@@ -2148,6 +2262,7 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (linear_shadow_) device_.remove_linear_shadow(static_cast<ID3D12Resource*>(this));
         if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
@@ -2837,6 +2952,11 @@ public:
                                                   const D3D12_BOX* box) override {
         return cpu_copy(false, subresource, box, data, row_pitch, depth_pitch);
     }
+    void mark_linear_shadow() { linear_shadow_ = true; }
+    static bool try_add_ref_iface(ID3D12Resource* iface) {
+        auto* r = Resource::from<Resource>(iface);
+        return r && r->try_add_ref();
+    }
 
 private:
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
@@ -3082,6 +3202,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    bool linear_shadow_ = false;
     bool fallback_alias_ = false;  // also registered at the title's VA as id() | 1 (alias_fallback_va)
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
@@ -7786,9 +7907,19 @@ public:
 
     // Slot 133's linear shader-readable textures use padded rows and subresource offsets. Copy the texels
     // present at placement time into a Vulkan image.
-    HRESULT create_linear_texture_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc,
+    HRESULT create_linear_texture_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc_in,
                                                   REFIID riid, void** out) {
-        if (!address || allocation(desc).SizeInBytes == UINT64_MAX) return E_INVALIDARG;
+        if (!address) return E_INVALIDARG;
+        D3D12_RESOURCE_DESC desc = desc_in;
+        if (allocation(desc).SizeInBytes == UINT64_MAX && desc.Alignment != 0) desc.Alignment = 0;
+        if (allocation(desc).SizeInBytes == UINT64_MAX) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: linear slot-133 alloc invalid (%llux%u fmt=%u mips=%u align=%llu flags=0x%x)\n",
+                         static_cast<unsigned long long>(desc.Width), static_cast<unsigned>(desc.Height),
+                         static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.MipLevels),
+                         static_cast<unsigned long long>(desc.Alignment), static_cast<unsigned>(desc.Flags));
+            return E_INVALIDARG;
+        }
         if (state_.texture_format(desc).aspects != VK_IMAGE_ASPECT_COLOR_BIT) return E_NOTIMPL;
         const UINT mip_count = desc.MipLevels ? desc.MipLevels : full_mips(desc.Width, desc.Height, 1);
         if (!mip_count || mip_count > D3D12_REQ_MIP_LEVELS) return E_INVALIDARG;
@@ -7798,15 +7929,9 @@ public:
         GetCopyableFootprints(&desc, 0, mip_count, 0, footprints.data(), nullptr, nullptr, &size);
         const auto base = reinterpret_cast<std::uintptr_t>(address);
         if (!size || size == UINT64_MAX || size > UINTPTR_MAX - base) return E_INVALIDARG;
-        for (auto cursor = base; cursor < base + size;) {
-            MEMORY_BASIC_INFORMATION region{};
-            if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) ||
-                region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-                return E_INVALIDARG;
-            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
-            if (end <= cursor) return E_INVALIDARG;
-            cursor = end;
-        }
+
+        const auto* pages = static_cast<const std::uint8_t*>(address);
+        const bool committed = DeviceState::pages_committed_readable(pages, size);
 
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
@@ -7815,13 +7940,53 @@ public:
         ID3D12Resource* texture = nullptr;
         HRESULT hr = CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
                                              D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture));
-        if (FAILED(hr)) return hr;
-        for (UINT mip = 0; mip < mip_count && SUCCEEDED(hr); ++mip) {
-            const auto& layout = footprints[mip];
-            const auto* texels = static_cast<const std::byte*>(address) + layout.Offset;
-            hr = texture->WriteToSubresource(mip, nullptr, texels, layout.Footprint.RowPitch, 0);
+        if (FAILED(hr)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: linear slot-133 CreateCommittedResource FAILED hr=0x%08x (%llux%u fmt=%u align=%llu)\n",
+                         static_cast<unsigned>(hr), static_cast<unsigned long long>(desc.Width),
+                         static_cast<unsigned>(desc.Height), static_cast<unsigned>(desc.Format),
+                         static_cast<unsigned long long>(desc.Alignment));
+            return hr;
         }
-        if (SUCCEEDED(hr)) hr = texture->QueryInterface(riid, out);
+        bool nonzero = false;
+        std::uint64_t initial_hash = 0;
+        bool uploaded = false;
+        if (committed) {
+            initial_hash = DeviceState::sample_linear_hash(pages, size, nonzero);
+            for (UINT mip = 0; mip < mip_count && SUCCEEDED(hr); ++mip) {
+                const auto& layout = footprints[mip];
+                const auto* texels = pages + layout.Offset;
+                hr = texture->WriteToSubresource(mip, nullptr, texels, layout.Footprint.RowPitch, 0);
+            }
+            uploaded = SUCCEEDED(hr);
+        }
+        if (SUCCEEDED(hr)) {
+            if (auto* r = Resource::from<Resource>(texture)) {
+                r->set_title_va(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+                r->mark_linear_shadow();
+                DeviceState::LinearTexShadow s{};
+                s.resource = texture;
+                s.try_add_ref = &Resource::try_add_ref_iface;
+                s.pages = pages;
+                s.mip_count = mip_count;
+                s.width = static_cast<UINT>(desc.Width);
+                s.height = desc.Height;
+                s.format = desc.Format;
+                s.footprints = footprints;
+                s.total_bytes = size;
+                s.last_hash = initial_hash;
+                s.ever_uploaded = uploaded;
+                state_.add_linear_shadow(s);
+            }
+            static std::atomic<int> created_log{0};
+            const int n = created_log.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 12)
+                std::fprintf(stderr,
+                             "[rt] d3d12: created live linear slot-133 texture #%d (%llux%u fmt=%u va=%p committed=%d)\n",
+                             n, static_cast<unsigned long long>(desc.Width), static_cast<unsigned>(desc.Height),
+                             static_cast<unsigned>(desc.Format), address, committed ? 1 : 0);
+            hr = texture->QueryInterface(riid, out);
+        }
         texture->Release();
         return hr;
     }
