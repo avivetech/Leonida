@@ -130,6 +130,9 @@ void log_once(const char* what, int value) {
 // VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
 // `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
 // read 64 MiB of them in 253 ms on a Core i9-13900K (253 MiB/s), MOVNTDQA in 13 to 17 ms (4 to 5 GiB/s). Paid at every submission.
+#if defined(__clang__) && defined(_M_X64)
+__attribute__((target("sse4.1")))
+#endif
 bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
     __try {
         if (streaming) {
