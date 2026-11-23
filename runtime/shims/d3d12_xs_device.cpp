@@ -1600,28 +1600,26 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
         const std::uint64_t ok = present_ok.fetch_add(1, std::memory_order_relaxed) + 1;
         if (ok == 1 || ok == 10 || ok == 100 || ok == 1000 || ok == 5000) {
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: PresentX #%llu ok (total ok=%llu fail=%llu planes=%u tok=%llu res_cnt=%u res0=%p cs=%u flags=0x%x)\n",
+                         "[rt] d3d12_xs: PresentX #%llu ok (total ok=%llu fail=%llu planes=%u tok=%llu res_cnt=%u res0=%p cs=%u)\n",
                          static_cast<unsigned long long>(n), static_cast<unsigned long long>(ok),
                          static_cast<unsigned long long>(present_fail.load(std::memory_order_relaxed)),
                          static_cast<unsigned>(plane_count),
                          plane_arr && plane_count ? static_cast<unsigned long long>(plane_arr[0].Token) : 0ull,
                          plane_arr && plane_count ? plane_arr[0].ResourceCount : 0u,
                          plane_arr && plane_count && plane_arr[0].ppResources ? static_cast<void*>(plane_arr[0].ppResources[0]) : nullptr,
-                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u,
-                         present_params ? present_params->Flags : 0u);
+                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u);
         }
     } else {
         const std::uint64_t fail = present_fail.fetch_add(1, std::memory_order_relaxed) + 1;
         if (fail <= 5) {
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: PresentX #%llu FAILED hr=0x%08x (planes=%u tok=%llu res_cnt=%u res0=%p cs=%u flags=0x%x)\n",
+                         "[rt] d3d12_xs: PresentX #%llu FAILED hr=0x%08x (planes=%u tok=%llu res_cnt=%u res0=%p cs=%u)\n",
                          static_cast<unsigned long long>(n), static_cast<unsigned>(hr),
                          static_cast<unsigned>(plane_count),
                          plane_arr && plane_count ? static_cast<unsigned long long>(plane_arr[0].Token) : 0ull,
                          plane_arr && plane_count ? plane_arr[0].ResourceCount : 0u,
                          plane_arr && plane_count && plane_arr[0].ppResources ? static_cast<void*>(plane_arr[0].ppResources[0]) : nullptr,
-                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u,
-                         present_params ? present_params->Flags : 0u);
+                         plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u);
         }
     }
     return hr_to_u64(hr);
@@ -2452,15 +2450,6 @@ template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
     vtable[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
-}
-
-// Console list slot 51, PC ClearDepthStencilView: its FLOAT depth arrives in XMM3, which the integer thunk does not
-// declare and note_list_slot's first-call log clobbers, so this slot gets a typed thunk (#2490 review).
-void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
-                                          FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT* rects) {
-    note_list_slot(51, view.ptr, static_cast<std::uint32_t>(flags), stencil, rect_count,
-                   self->device->console_layout.load(std::memory_order_relaxed));
-    self->real->ClearDepthStencilView(view, flags, depth, stencil, rect_count, rects);
 }
 
 void** get_list_vtable() {
@@ -3645,7 +3634,7 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
         return create_pc();
     }
     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
-    HRESULT hr = handler(self->real, memory, desc, riid, out);
+    HRESULT hr = handler(self->real, memory, desc, 0xFFFFFFFFu, riid, out);
     if (SUCCEEDED(hr)) {
         static std::atomic<bool> logged{false};
         if (first_call(logged))
