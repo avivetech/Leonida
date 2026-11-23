@@ -292,15 +292,12 @@ constexpr std::uint32_t resolve_mip_count(const XgResourceDesc& desc) {
 }
 
 constexpr bool is_known_layout(std::uint32_t layout) {
+    if (layout >= 0x100u && layout <= 0x11Fu) return true;  // Xbox console tile modes (0x100 linear, 0x101/0x102/0x105/0x10A...)
     switch (layout) {
     case kLayoutUnknown:
     case kLayoutRowMajor:
     case kLayout64KbUndefinedSwizzle:
     case kLayout64KbStandardSwizzle:
-    case kLayoutLinear:
-    case kLayoutSw64KbD:
-    case kLayoutSw4KbS:
-    case kLayoutSw64KbReserved:
         return true;
     default:
         return false;
