@@ -1303,6 +1303,12 @@ struct DeviceState {
             format.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
             format.d24_as_float = true;
         }
+        if (format.format == VK_FORMAT_A4R4G4B4_UNORM_PACK16 &&
+            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !color_attachment_usable(format.format)) {
+            log_once("A4R4G4B4_UNORM_PACK16 render target unavailable, using B8G8R8A8_UNORM; format", desc.Format);
+            format.format = VK_FORMAT_B8G8R8A8_UNORM;
+        }
         return format;
     }
 
@@ -4304,9 +4310,12 @@ public:
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
-            graphics_.color_formats[i] = desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.info.a8_render_target
-                                             ? kA8UnormFormat
-                                             : vulkan_format(desc.RTVFormats[i], false).format;
+            VkFormat cf = desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.info.a8_render_target
+                              ? kA8UnormFormat
+                              : vulkan_format(desc.RTVFormats[i], false).format;
+            if (cf == VK_FORMAT_A4R4G4B4_UNORM_PACK16 && !device_.color_attachment_usable(cf))
+                cf = VK_FORMAT_B8G8R8A8_UNORM;
+            graphics_.color_formats[i] = cf;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -5278,7 +5287,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             return false;
         }
         // An A8 render target is viewed in its own A8 format (Format::a8_as_alpha), other A8 textures through R8.
-        named = resource.a8_as_alpha() ? resource_format : texture_storage_format(view.format, false).format;
+        // A B4G4R4A4 render target stored as B8G8R8A8_UNORM (when A4R4G4B4 isn't attachment-usable) keeps its format.
+        named = (resource.a8_as_alpha() ||
+                 (view.format == DXGI_FORMAT_B4G4R4A4_UNORM && resource_format == VK_FORMAT_B8G8R8A8_UNORM))
+                    ? resource_format
+                    : texture_storage_format(view.format, false).format;
         if (g::is_depth_stencil_format(named)) {
             log_once("depth-stencil view format on a colour texture:", int(view.format));
             return false;
