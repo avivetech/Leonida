@@ -6706,6 +6706,9 @@ public:
             if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = leonida::gfx10::ImageType::image_1d;
                 view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.layer_count = 1;
             } else if (array)
                 view.type = leonida::gfx10::ImageType::image_2d_array;
         } else {
@@ -6728,14 +6731,41 @@ public:
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
                 break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D: {
+                const D3D12_RESOURCE_DESC& rd = r->desc();
+                const UINT mip = desc->Texture3D.MipSlice;
+                if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || mip >= rd.MipLevels) {
+                    log_once("unordered-access view of a 3D texture with bad dimension or mip; mip", int(mip));
+                    return;
+                }
+                const UINT mip_depth = std::max<UINT>(1u, UINT(rd.DepthOrArraySize) >> mip);
+                const UINT first_w = desc->Texture3D.FirstWSlice;
+                const UINT w_size = desc->Texture3D.WSize;
+                if (first_w >= mip_depth || !w_size || (w_size != UINT_MAX && w_size > mip_depth - first_w)) {
+                    log_once("unordered-access view of a 3D texture with out-of-range W slices; first W slice",
+                             int(first_w));
+                    return;
+                }
+                if (first_w != 0 || (w_size != UINT_MAX && w_size != mip_depth)) {
+                    log_once("unordered-access view of a partial 3D slice range not supported; first W slice",
+                             int(first_w));
+                    return;
+                }
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = mip;
+                view.layer_count = 1;
+                break;
+            }
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
                 return;
             }
         }
-        // B8G8R8X8 has no typed UAV, so no format of its family gives an unordered-access view.
-        if (alpha_unused(r->desc().Format) || alpha_unused(view.format)) {
-            log_once("unordered-access view of a B8G8R8X8 format; format", int(view.format));
+        // B8G8R8X8 and sRGB formats have no UAVs in D3D12 (nor Vulkan storage image views).
+        const DXGI_FORMAT uav_format = view.format != DXGI_FORMAT_UNKNOWN ? view.format : r->desc().Format;
+        if (alpha_unused(r->desc().Format) || alpha_unused(view.format) ||
+            uav_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || uav_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            log_once("unordered-access view of a B8G8R8X8 or sRGB format; format", int(uav_format));
             return;
         }
         write_image_descriptor(*r, view, destination, true);
