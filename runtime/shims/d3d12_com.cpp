@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -30,6 +31,12 @@
 namespace rt::d3d12 {
 
 // A handle in a title-backed descriptor heap (#7021) maps to the layer's own slot; any other is unchanged.
+static bool red_diag() {
+    static const bool on = [] { const char* v = std::getenv("LEONIDA_RED_DIAG"); return v && *v && *v != '0'; }();
+    static std::atomic<int> budget{4000};
+    return on && budget.fetch_sub(1) > 0;
+}
+
 static D3D12_CPU_DESCRIPTOR_HANDLE layer_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     return rt::d3d12_xs::translate_cpu_descriptor_handle(nullptr, handle);
 }
@@ -728,6 +735,10 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        if (red_diag())
+            std::fprintf(stderr, "[red] clear rtv res=%llx colour=%g,%g,%g,%g rects=%u\n",
+                         (unsigned long long)reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr)->resource,
+                         color[0], color[1], color[2], color[3], count);
         const bool magenta = debug_clear_ && !color[0] && !color[1] && !color[2] && !color[3];
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr),
                                         magenta ? leonida::ClearColor{1, 0, 1, 1}
@@ -1456,6 +1467,12 @@ private:
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         UserData data;
         graphics_user_data(false, data);  // the vertex window alone always fits
+        if (red_diag())
+            std::fprintf(stderr, "[red] draw pso=%llx rt0=%llx rts=%u count=%u inst=%u vp=%gx%g ud=%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                         (unsigned long long)graphics_pipeline_, (unsigned long long)render_targets_[0].resource,
+                         render_target_count_, count, instances, viewport_.width, viewport_.height, data[0], data[1], data[2], data[3], data[4],
+                         data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14],
+                         data[15]);
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
