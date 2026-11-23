@@ -23,7 +23,9 @@ using SuggestFn = HRESULT(__stdcall*)(const void*, uint32_t, uint32_t*);
 using AddRefFn = ULONG(__stdcall*)(void*);
 using ReleaseFn = ULONG(__stdcall*)(void*);
 using GetLayoutFn = HRESULT(__stdcall*)(void*, void*);
-using CopySubresourceFn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+using CopyIntoSubresourceFn = HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
+using CopyFromSubresourceFn =
+    HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t, uint32_t);
 using GetTilingFn = HRESULT(__stdcall*)(void*, uint32_t*, void*, void*, uint32_t*, uint32_t, void*);
 constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
 
@@ -83,10 +85,11 @@ int main() {
     std::vector<uint8_t> tiled_buf(static_cast<size_t>(layout.size_bytes), 0);
     std::vector<uint8_t> src(512 * 512 * 4);
     for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<uint8_t>((i * 29u + 7u) & 0xFFu);
-    check(reinterpret_cast<CopySubresourceFn>(vtable[8])(computer, tiled_buf.data(), 0, 0, src.data(), 512 * 4, 0) == S_OK,
+    check(reinterpret_cast<CopyIntoSubresourceFn>(vtable[8])(computer, tiled_buf.data(), 0, 0, src.data(), 512 * 4, 0) == S_OK,
           "slot 8 (CopyIntoSubresource) succeeds");
     std::vector<uint8_t> roundtrip(src.size(), 0);
-    check(reinterpret_cast<CopySubresourceFn>(vtable[9])(computer, roundtrip.data(), 0, 0, tiled_buf.data(), 512 * 4, 0) == S_OK,
+    check(reinterpret_cast<CopyFromSubresourceFn>(vtable[9])(computer, roundtrip.data(), 0, 0, 0, tiled_buf.data(),
+                                                             512 * 4, 0) == S_OK,
           "slot 9 (CopyFromSubresource) succeeds");
     check(roundtrip == src, "slots 8 and 9 round-trip a 512x512 RGBA8 swizzled surface");
 

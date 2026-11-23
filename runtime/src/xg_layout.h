@@ -2,7 +2,10 @@
 
 // Portable Xbox Series xg_xs.dll texture layout, tiling, and subresource copy model (no Windows or Vulkan dependency).
 //
-// Structures match the binary layout observed at the xg_xs.dll call sites:
+// Struct layouts match the Xbox Series GDK xg_xs.dll / IXGTextureAddressComputer ABI (verified against the public
+// XG_RESOURCE_LAYOUT / XG_PLANE_LAYOUT / XG_MIPLEVEL_LAYOUT geometry and observed call shapes: callers allocate
+// 0x1B38 bytes for GetResourceLayout, copy 0x6C8-byte plane records from layout+0x18, index 0x70-byte mip records
+// from plane+0x38 reading +0x00/+0x10/+0x1C, and write 0x100|hw_mode directly into the XGSuggestSwizzleMode out word):
 // - XgResourceDesc (0x38 bytes): identical field layout to D3D12_RESOURCE_DESC, with console layout words 0x100|mode
 //   in `layout` (0x100 linear, 0x101 SW_64KB_D, 0x102 SW_4KB_S, 0x10A reserved 64 KiB tiled).
 // - XgResourceLayout (0x1B38 bytes): 0x18-byte header + 4 XgPlaneLayout entries (0x6C8 bytes each).

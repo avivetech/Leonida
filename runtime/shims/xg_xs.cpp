@@ -10,7 +10,7 @@
 //       - slot 0 / 1: AddRef / Release
 //       - slot 2: GetResourceLayout(XG_RESOURCE_LAYOUT* out) (0x1B38 bytes: 4 planes of 0x6C8, 15 mips of 0x70)
 //       - slot 8: CopyIntoSubresource(dst, plane, subresource, src, srcRowPitch, srcSlicePitch)
-//       - slot 9: CopyFromSubresource(dst, plane, subresource, src, dstRowPitch, dstSlicePitch) (symmetric)
+//       - slot 9: CopyFromSubresource(dst, plane, subresource, flags, src, dstRowPitch, dstSlicePitch)
 //       - slot 10: GetResourceTiling(numTiles, packedMipDesc, tileShape, numSubresourceTilings, first, tilings)
 //
 // Layout, tiling and GFX10 swizzling live in the portable header runtime/src/xg_layout.h (tested by xg_layout_test).
@@ -87,8 +87,9 @@ HRESULT __stdcall computer_copy_into_subresource(void* self_ptr, void* destinati
 }
 
 HRESULT __stdcall computer_copy_from_subresource(void* self_ptr, void* destination, uint32_t plane,
-                                                 uint32_t subresource, const void* source,
+                                                 uint32_t subresource, uint32_t flags, const void* source,
                                                  uint32_t destination_row_pitch, uint32_t destination_slice_pitch) {
+    (void)flags;
     auto* self = static_cast<XgComputer*>(self_ptr);
     if (!self || self->is_static_fallback) return kNotImpl;
     return leonida::xg::copy_from_subresource(self->desc, self->layout, destination, plane, subresource, source,
