@@ -33,7 +33,7 @@ namespace rt::d3d12 {
 // A handle in a title-backed descriptor heap (#7021) maps to the layer's own slot; any other is unchanged.
 static bool red_diag() {
     static const bool on = [] { const char* v = std::getenv("LEONIDA_RED_DIAG"); return v && *v && *v != '0'; }();
-    static std::atomic<int> budget{4000};
+    static std::atomic<int> budget{40000};
     return on && budget.fetch_sub(1) > 0;
 }
 
@@ -1172,6 +1172,14 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        if (red_diag() && layout && !is_compute(state)) {
+            std::fprintf(stderr, "[red] rootsig %p flags=%x heap_sgpr=%u/%u end=%u params=%zu:", (void*)signature,
+                         layout->flags, layout->graphics_resource_heap_sgpr, layout->graphics_sampler_heap_sgpr,
+                         layout->graphics_end_sgpr, layout->parameters.size());
+            for (const auto& p : layout->parameters)
+                std::fprintf(stderr, " [t%u s%u c%u d%u]", unsigned(p.type), p.user_offset, p.constant_count, p.table_descriptors);
+            std::fprintf(stderr, "\n");
+        }
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
@@ -1229,6 +1237,9 @@ private:
             });
             return;
         }
+        if (red_diag() && !is_compute(state))
+            std::fprintf(stderr, "[red] root const idx=%u n=%u off=%u v0=%x\n", index, count, offset,
+                         data && count ? *static_cast<const std::uint32_t*>(data) : 0u);
         const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
@@ -1242,6 +1253,9 @@ private:
                 l.address(compute ? l.compute_ : l.graphics_, index, va, type);
             }))
             return;
+        if (red_diag() && !is_compute(state))
+            std::fprintf(stderr, "[red] root addr idx=%u va=%llx type=%u layout=%p\n", index, (unsigned long long)va,
+                         unsigned(type), (const void*)state.layout);
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
         // A root view into the title's own memory (a slot-133 buffer, a constant ring) gets the console VA of a GPU
@@ -1347,6 +1361,9 @@ private:
         cbv_srv_uav_base_ = cbv_base;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        if (red_diag())
+            std::fprintf(stderr, "[red] heaps cbv=%p base=%llx smp=%p base=%llx\n", (void*)cbv,
+                         (unsigned long long)cbv_base, (void*)smp, (unsigned long long)smp_base);
     }
 
     // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
