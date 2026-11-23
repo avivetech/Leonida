@@ -1124,6 +1124,23 @@ public:
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
     }
+    // Registers `alias` as `id`'s buffer at another VA too (a title-placed buffer the driver would not import is found
+    // at the title's VA). False when `id` is not a registered buffer. remove_resource(alias) drops it.
+    bool alias_buffer(ResourceId id, ResourceId alias, std::uint64_t va) {
+        std::unique_lock lock(resource_mutex_);
+        const auto it = resources_.find(id);
+        if (it == resources_.end() || !it->second.buffer) return false;
+        ResourceBinding binding = it->second;
+        binding.va = va;
+        set_resource_locked(alias, binding);
+        return true;
+    }
+    // Whether `va` is in a buffer this context knows by VA (the index buffer_at searches).
+    bool knows_buffer_va(std::uint64_t va) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(va, hit);
+    }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
         set_resource_locked(id, binding);
