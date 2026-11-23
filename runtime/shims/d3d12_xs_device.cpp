@@ -1719,7 +1719,8 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                          plane_arr && plane_count ? plane_arr[0].ColorSpace : 0u);
         }
         if (state->capture_enabled &&
-            (ok == 1 || ok == 10 || ok == 50 || ok == 100 || ok == 250 || (ok % 500 == 0))) {
+            (ok == 1 || ok == 10 || ok == 50 || ok == 100 || ok == 250 ||
+             (ok < 20000 ? (ok % 500 == 0) : (ok % 25 == 0)))) {
             dump_present_frame(state, ok);
         }
     } else {
@@ -4144,15 +4145,9 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         }
         for (UINT i = 0; i < count; ++i) {
             D3D12_RESOURCE_DESC1 d{};
-            std::memcpy(&d, &raw_descs[i], sizeof(D3D12_RESOURCE_DESC));
+            const D3D12_RESOURCE_DESC norm = pc_resource_desc(raw_descs[i]);
+            std::memcpy(&d, &norm, sizeof(D3D12_RESOURCE_DESC));
             d.SamplerFeedbackMipRegion = {};
-            if (static_cast<std::uint32_t>(d.Layout) >
-                static_cast<std::uint32_t>(D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)) {
-                d.Layout = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            }
-            constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
-            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask);
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();
@@ -4166,6 +4161,24 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     }
     *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
     device8->Release();
+    if (ret->SizeInBytes == UINT64_MAX) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            if (raw_descs && count > 0) {
+                const D3D12_RESOURCE_DESC& d = raw_descs[0];
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 108: size 0xffffffffffffffff; desc 0: dimension %u format %u %llux%ux%u "
+                             "mips %u samples %u layout 0x%x flags 0x%x\n",
+                             static_cast<unsigned>(d.Dimension), static_cast<unsigned>(d.Format),
+                             static_cast<unsigned long long>(d.Width), static_cast<unsigned>(d.Height),
+                             static_cast<unsigned>(d.DepthOrArraySize), static_cast<unsigned>(d.MipLevels),
+                             static_cast<unsigned>(d.SampleDesc.Count), static_cast<unsigned>(d.Layout),
+                             static_cast<unsigned>(d.Flags));
+            } else {
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 108: size 0xffffffffffffffff (count=%u)\n", count);
+            }
+        }
+    }
     return reinterpret_cast<std::uint64_t>(ret);
 }
 

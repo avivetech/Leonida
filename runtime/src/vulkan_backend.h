@@ -1185,6 +1185,8 @@ public:
             img = it->second.image;
             unindex_buffer(id, it->second);
             resources_.erase(it);
+            if (removed_.size() >= 65536) removed_.clear();
+            removed_.insert(id);
             if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
                 sparse_resource = std::move(sparse->second);
                 sparse_resources_.erase(sparse);
@@ -1584,6 +1586,8 @@ private:
         if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
+    bool was_removed(ResourceId id) const { return removed_.count(id) != 0; }
+
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
         return it == resources_.end() ? nullptr : &it->second;
@@ -1689,6 +1693,7 @@ private:
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_set<ResourceId> removed_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -2351,6 +2356,17 @@ private:
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
+            if (result == ReplayResult::unresolved_resource) {
+                static std::atomic<std::uint64_t> logged{0};
+                const PreparedList& p = prepared[i];
+                const std::uint64_t bit = std::uint64_t(1) << (p.unresolved_kind % 64);
+                if (!(logged.fetch_or(bit) & bit))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: unknown resource: list %zu command %zu (kind %zu) names id 0x%llx (%s)\n",
+                                 i, p.unresolved_command, p.unresolved_kind,
+                                 static_cast<unsigned long long>(p.unresolved_id),
+                                 context_.was_removed(p.unresolved_id) ? "released earlier" : "never registered");
+            }
             if (result != ReplayResult::success) return result;
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)

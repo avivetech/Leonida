@@ -494,7 +494,10 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_D16_UNORM: return {VK_FORMAT_D16_UNORM, d};
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return {VK_FORMAT_D32_SFLOAT_S8_UINT, ds};
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return {VK_FORMAT_D24_UNORM_S8_UINT, ds};
-    case static_cast<DXGI_FORMAT>(118): return {VK_FORMAT_D24_UNORM_S8_UINT, ds};  // Xbox D16_UNORM_S8_UINT -> D24S8
+    case static_cast<DXGI_FORMAT>(117): return {VK_FORMAT_D24_UNORM_S8_UINT, ds, true};  // Xbox R16G8_TYPELESS
+    case static_cast<DXGI_FORMAT>(118): return {VK_FORMAT_D24_UNORM_S8_UINT, ds};        // Xbox D16_UNORM_S8_UINT
+    case static_cast<DXGI_FORMAT>(119): return {VK_FORMAT_D24_UNORM_S8_UINT, d};         // Xbox R16_UNORM_X8_TYPELESS
+    case static_cast<DXGI_FORMAT>(120): return {VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT};  // Xbox X16_TYPELESS_G8_UINT
     case DXGI_FORMAT_R32_TYPELESS:
         return depth ? Format{VK_FORMAT_D32_SFLOAT, d, true} : Format{VK_FORMAT_R32_SFLOAT, color, true};
     case DXGI_FORMAT_R16_TYPELESS:
@@ -5207,7 +5210,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         (view.format == DXGI_FORMAT_X24_TYPELESS_G8_UINT &&
          (desc.Format == DXGI_FORMAT_R24G8_TYPELESS || desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT)) ||
         (view.format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT &&
-         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT));
+         (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) ||
+        (view.format == static_cast<DXGI_FORMAT>(120) &&
+         (desc.Format == static_cast<DXGI_FORMAT>(117) || desc.Format == static_cast<DXGI_FORMAT>(118)));
     if (stencil && !stencil_format_fits) {
         log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
@@ -5268,7 +5273,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
             (desc.Format == DXGI_FORMAT_R24G8_TYPELESS && view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) ||
             (desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
              (view.format == DXGI_FORMAT_UNKNOWN || view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) ||
-            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+            (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS && view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) ||
+            (desc.Format == static_cast<DXGI_FORMAT>(118) &&
+             (view.format == DXGI_FORMAT_UNKNOWN || view.format == static_cast<DXGI_FORMAT>(119))) ||
+            (desc.Format == static_cast<DXGI_FORMAT>(117) && view.format == static_cast<DXGI_FORMAT>(119));
         if (!depth_format_fits) {
             log_once("incompatible depth shader-resource view format:", int(view.format));
             return false;
