@@ -190,6 +190,23 @@ public:
     std::uint64_t pulled() const { return pulled_.load(std::memory_order_relaxed); }
 
     // The first device to register keeps the hooks until it clears them.
+    using VbIbResolver = void (*)(void* context, std::uint64_t va, std::uint64_t bytes);
+    void set_vb_ib_hook(void* context, VbIbResolver resolver) {
+        std::lock_guard lock(hook_mutex_);
+        if (hook_context_ && hook_context_ != context) return;
+        vb_ib_resolver_ = resolver;
+    }
+    void ensure_vb_ib(std::uint64_t va, std::uint64_t bytes) {
+        if (!va) return;
+        VbIbResolver resolver;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            resolver = vb_ib_resolver_;
+            context = hook_context_;
+        }
+        if (resolver) resolver(context, va, bytes);
+    }
     void set_hooks(void* context, Resolver resolver, TableScanner scanner) {
         std::lock_guard lock(hook_mutex_);
         if (hook_context_) return;
@@ -203,6 +220,7 @@ public:
         hook_context_ = nullptr;
         resolver_ = nullptr;
         scanner_ = nullptr;
+        vb_ib_resolver_ = nullptr;
     }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
@@ -231,6 +249,7 @@ private:
     void* hook_context_ = nullptr;
     Resolver resolver_ = nullptr;
     TableScanner scanner_ = nullptr;
+    VbIbResolver vb_ib_resolver_ = nullptr;
     void* source_context_ = nullptr;
     DescriptorSource source_ = nullptr;
     std::atomic<std::uint64_t> pulled_{0};

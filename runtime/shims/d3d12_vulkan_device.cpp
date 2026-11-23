@@ -842,6 +842,7 @@ struct DeviceState {
     struct TitleWindow {
         std::uint64_t start;
         std::uint64_t shader_va;
+        leonida::ResourceId resource_id = 0;
     };
     static constexpr std::uint64_t kTitleWindowAlign = 65536;
     static constexpr std::uint64_t kTitleWindowMax = 16ull << 20;  // the most one address pulls in
@@ -898,7 +899,15 @@ struct DeviceState {
         copy_title_pages(mapped, pages, std::size_t(size));
         add_shadow({pages, mapped, std::size_t(size)});
         aliases.add(start, size, offset);
-        title_windows.push_back({start, offset});
+        const leonida::ResourceId wid = 0x7e00000000000000ull | (std::uint64_t(title_windows.size() + 1) << 1);
+        leonida::ResourceBinding win_binding{};
+        win_binding.buffer = arena.buffer;
+        win_binding.buffer_offset = offset;
+        win_binding.va = start;
+        win_binding.size = size;
+        win_binding.host = mapped;
+        context->add_resource(wid, win_binding);
+        title_windows.push_back({start, offset, wid});
         title_window_bytes += size;
         if (title_windows.size() <= 4 || !(title_windows.size() & (title_windows.size() - 1)))
             std::fprintf(stderr, "[rt] d3d12: a %llu KiB window of the title's memory, named by a shader address, is "
@@ -907,6 +916,65 @@ struct DeviceState {
                          static_cast<unsigned long long>(title_window_bytes >> 10));
         out = offset + (va - start);
         return true;
+    }
+
+    // Mirrors a raw CPU-memory vertex/index buffer VA (e.g. Scaleform dynamic VB at a Wine low-heap address) into the
+    // GPU address arena and registers it in VulkanContext so vk.buffer_at() resolves it on draw replay.
+    void ensure_vb_ib_window(std::uint64_t va, std::uint64_t bytes) {
+        if (!va || !arena.mapped || !context || context->knows_buffer_va(va)) return;
+        MEMORY_BASIC_INFORMATION mbi{};
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT || !mbi.Protect || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            !(mbi.Protect & kReadable))
+            return;
+        std::lock_guard lock(title_window_mutex);
+        if (context->knows_buffer_va(va)) return;
+        auto& aliases = leonida::title_va_aliases();
+        std::uint64_t title_lo = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        std::uint64_t title_hi = title_lo + mbi.RegionSize;
+        std::uint64_t xmem_lo = 0, xmem_hi = 0;
+        if (aliases.title_memory(va, xmem_lo, xmem_hi)) {
+            title_lo = std::max(title_lo, xmem_lo);
+            title_hi = std::min(title_hi, xmem_hi);
+        }
+        std::uint64_t lo = 0, hi = UINT64_MAX;
+        aliases.gap(va, lo, hi);
+        lo = std::max(lo, title_lo);
+        hi = std::min(hi, title_hi);
+        const std::uint64_t want = std::clamp<std::uint64_t>(bytes, 1, kTitleWindowMax);
+        const std::uint64_t start = std::max(va & ~(kTitleWindowAlign - 1), lo);
+        std::uint64_t end = va > UINT64_MAX - want - kTitleWindowAlign ? UINT64_MAX
+                                                                        : (va + want + kTitleWindowAlign - 1) &
+                                                                              ~(kTitleWindowAlign - 1);
+        end = std::min(end, hi);
+        if (end <= va) return;
+        const std::uint64_t size = end - start;
+        VkDeviceSize offset = 0;
+        if (!arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) return;
+        auto* mapped = arena.mapped + offset;
+        const auto* pages = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(start));
+        copy_title_pages(mapped, pages, std::size_t(size));
+        add_shadow({pages, mapped, std::size_t(size)});
+        aliases.add(start, size, offset);
+        const leonida::ResourceId wid = 0x7e00000000000000ull | (std::uint64_t(title_windows.size() + 1) << 1);
+        leonida::ResourceBinding win_binding{};
+        win_binding.buffer = arena.buffer;
+        win_binding.buffer_offset = offset;
+        win_binding.va = start;
+        win_binding.size = size;
+        win_binding.host = mapped;
+        context->add_resource(wid, win_binding);
+        title_windows.push_back({start, offset, wid});
+        title_window_bytes += size;
+        static std::atomic<unsigned> vb_logged{0};
+        const unsigned n = ++vb_logged;
+        if (n <= 8 || !(n & (n - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: mirrored raw title VB/IB window #%u at 0x%llx (%llu KiB, requested va=0x%llx bytes=%llu)\n",
+                         n, static_cast<unsigned long long>(start), static_cast<unsigned long long>(size >> 10),
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes));
     }
 
     // The shader-visible CBV/SRV/UAV heaps (arena offset -> end), for the scan of bound tables before a submission.
@@ -5666,6 +5734,10 @@ public:
             [](void* device, std::uint64_t table, std::uint32_t descriptors) {
                 static_cast<DeviceState*>(device)->scan_title_table(table, descriptors);
             });
+        leonida::title_va_aliases().set_vb_ib_hook(
+            &state_, [](void* device, std::uint64_t va, std::uint64_t bytes) {
+                static_cast<DeviceState*>(device)->ensure_vb_ib_window(va, bytes);
+            });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -6020,8 +6092,10 @@ public:
         leonida::title_va_aliases().clear_hooks(&state_);
         {
             std::lock_guard lock(state_.title_window_mutex);
-            for (const auto& window : state_.title_windows)
+            for (const auto& window : state_.title_windows) {
                 leonida::title_va_aliases().remove(window.start, window.shader_va);
+                if (state_.context && window.resource_id) state_.context->remove_resource(window.resource_id);
+            }
             state_.title_windows.clear();
         }
         if (state_.context) {
@@ -6078,6 +6152,7 @@ public:
         leonida::ResourceId id = 0;
         ID3D12Resource* found = nullptr;
         const bool ok = state_.context->buffer_resource_at(va, bytes, id, start, size, [&](leonida::ResourceId candidate) {
+            if ((candidate & 0xff00000000000000ull) == 0x7e00000000000000ull || (candidate & 1)) return false;
             auto* resource = static_cast<Resource*>(reinterpret_cast<ID3D12Resource*>(candidate));
             if (!resource->try_add_ref()) return false;
             found = resource;

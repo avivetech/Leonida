@@ -2415,6 +2415,24 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
             }
+            if constexpr (Slot == 85) {
+                // CopyTextureRegionX(pDst, DstX, DstY, DstZ, pSrc, pSrcBox, Flags) -> PC CopyTextureRegion (slot 16)
+                if (a1 && a5) {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: forwarding list slot 85 (CopyTextureRegionX) dst=%p (%u,%u,%u) src=%p box=%p flags=0x%llx\n",
+                                     reinterpret_cast<const void*>(a1), static_cast<unsigned>(a2),
+                                     static_cast<unsigned>(a3), static_cast<unsigned>(a4),
+                                     reinterpret_cast<const void*>(a5), reinterpret_cast<const void*>(a6),
+                                     static_cast<unsigned long long>(a7));
+                    self->real->CopyTextureRegion(reinterpret_cast<const D3D12_TEXTURE_COPY_LOCATION*>(a1),
+                                                  static_cast<UINT>(a2), static_cast<UINT>(a3), static_cast<UINT>(a4),
+                                                  reinterpret_cast<const D3D12_TEXTURE_COPY_LOCATION*>(a5),
+                                                  reinterpret_cast<const D3D12_BOX*>(a6));
+                }
+                return 0;
+            }
             return 0;  // unmodelled console slot: recorded above, never a PC call
         } else {
             if (pc >= self->pc_slot_count) {
