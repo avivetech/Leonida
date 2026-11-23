@@ -137,20 +137,38 @@ int main() {
 
     // ApuAlloc(virtualAddress*, physicalAddress*, size, alignment, flags).
     // Measured: flags=2 at one call site, flags=1 at another (PR #6885, confirmed
-    // by static read of 1.0.2.1).  Test both, plus 0 for cached allocations.
-    void* va = nullptr;
-    check(alloc(&va, nullptr, 4096, 0x800, 2) == S_OK && va != nullptr,
-          "ApuAlloc with flags=2 succeeds and returns a virtual address");
-    void* vb = nullptr;
-    check(alloc(&vb, nullptr, 4096, 0x800, 1) == S_OK && vb != nullptr,
-          "ApuAlloc with flags=1 (second measured value) also succeeds");
-    if (va) {
-        // The address must be aligned to 0x800 (2048).
-        check((reinterpret_cast<uintptr_t>(va) & (0x800 - 1)) == 0,
-              "ApuAlloc returns a 2048-byte aligned address");
-        // The address is valid through ApuIsVirtualAddressValid at the right alignment.
-        check(is_valid(va, 0x800) == TRUE,
-              "ApuIsVirtualAddressValid returns TRUE for the allocated address at align 0x800");
+    // by static read of 1.0.2.1).  Test the real boot flow: ApuCreateHeap creates
+    // a large cached heap and a smaller non-cached heap; flags=2 goes to non-cached,
+    // flags=1 goes to cached.
+    //
+    // The title's boot sequence:
+    //   ApuCreateHeap(cached_size, 0x226e00)
+    //   ApuAlloc(0x222e00, flags=2)   -- needs the non-cached heap, fits because 0x226e00 > 0x222e00
+    //   ApuAlloc(small, flags=1)      -- needs the cached heap
+    void* va_nc = nullptr;
+    // 0x222e00 is the title's real non-cached allocation size, must fit in the 0x226e00 heap.
+    check(alloc(&va_nc, nullptr, 0x222e00, 0x800, 2) == S_OK && va_nc != nullptr,
+          "ApuAlloc flags=2 at title's size 0x222e00 succeeds (within the 0x226e00 non-cached heap)");
+    void* va_c = nullptr;
+    // flags=1 goes to the large cached heap.
+    check(alloc(&va_c, nullptr, 4096, 0x800, 1) == S_OK && va_c != nullptr,
+          "ApuAlloc flags=1 succeeds on the cached heap (even after non-cached is mostly full)");
+    if (va_nc && va_c) {
+        check(is_valid(va_nc, 0x800) == TRUE,
+              "flags=2 allocation is in a valid heap");
+        check(is_valid(va_c, 0x800) == TRUE,
+              "flags=1 allocation is in a valid heap");
+        check(va_nc != va_c,
+              "flags=1 and flags=2 allocations are in different heaps");
+        // APU addresses use disjoint ranges.
+        const uint32_t apu_nc = map_virtual(va_nc);
+        const uint32_t apu_c = map_virtual(va_c);
+        check(apu_nc != apu_c,
+              "APU addresses are distinct for flags=1 and flags=2");
+        check(map_apu(apu_nc) == va_nc,
+              "ApuMapApuAddress round-trips the flags=2 block");
+        check(map_apu(apu_c) == va_c,
+              "ApuMapApuAddress round-trips the flags=1 block");
     }
 
     // Regression: cached (flags=0) and non-cached (flags=2) use separate bump offsets.
@@ -162,7 +180,7 @@ int main() {
           "ApuAlloc cached (flags=0) 3 MiB succeeds (within the 4 MiB cached heap)");
     const HRESULT cr_noncached = alloc(&noncached_block, nullptr, 0x1000, 0x800, 2);
     check(cr_noncached == S_OK && noncached_block != nullptr,
-          "ApuAlloc non-cached (flags=2) 4 KiB still succeeds (separate bump offset)");
+          "ApuAlloc non-cached (flags=2) 4 KiB still succeeds after the 0x222e00 one");
     if (cached_big && noncached_block) {
         check(is_valid(cached_big, 0x800) == TRUE,
               "cached 3 MiB block is in a valid heap");
@@ -170,7 +188,6 @@ int main() {
               "non-cached 4 KiB block is in a valid heap");
         check(cached_big != noncached_block,
               "cached and non-cached allocations return different addresses");
-        // APU addresses use disjoint ranges so cached and non-cached round-trip separately.
         const uint32_t cached_apu = map_virtual(cached_big);
         const uint32_t noncached_apu = map_virtual(noncached_block);
         check(cached_apu != noncached_apu,
@@ -182,7 +199,7 @@ int main() {
     }
 
     // ApuFree(void*): void return, no-op.
-    free_mem(va);
+    free_mem(va_nc);
     free_mem(nullptr);
     check(true, "ApuFree accepts both a valid pointer and nullptr without crashing");
 

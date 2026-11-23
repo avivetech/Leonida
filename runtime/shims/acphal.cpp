@@ -449,10 +449,10 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
 
     std::lock_guard lock(g_apu_mutex);
 
-    // The title always passes flags=2 (non-cached per #6885), but the public GDK
-    // docs define 0=cached and 1=non-cached.  Treat anything non-zero as
-    // non-cached so both work.
-    bool cached = (flags == 0);
+    // Measured call sites (1.0.2.1): flags=2 (size 0x222e00) routes to the non-cached
+    // heap; flags=1 (size from a register) routes to the cached heap.  Both must succeed
+    // at boot.  flags=0 is never used but retained as cached for completeness.
+    bool cached = (flags == 0 || flags == 1);
     void* heap_base = cached ? g_apu_cached_base : g_apu_noncached_base;
     uint64_t heap_size = cached ? g_apu_cached_size : g_apu_noncached_size;
 
