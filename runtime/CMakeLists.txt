@@ -108,8 +108,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
-    shims/acphal.cpp
-    shims/xapu_chad.cpp
     shims/xg_xs.cpp
     shims/chad.cpp
     shims/xapu.cpp
@@ -299,17 +297,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(chad_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(chad_test PRIVATE /OPT:NOREF)
-
-  # acphal shim ABI test: resolves the registered acphal.dll exports through the registry.
-  add_executable(acphal_test
-    test/acphal_test.cpp
-    shims/acphal.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(acphal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -1278,9 +1265,6 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET chad_test)
     add_test(NAME chad COMMAND chad_test)
-  endif()
-  if(WIN32 AND TARGET acphal_test)
-    add_test(NAME acphal COMMAND acphal_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
