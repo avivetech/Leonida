@@ -312,6 +312,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
+  # DLSS (nvngx) backend: translation surface and unit test. The .cpp pulls in the NGX declarations from
+  # test/nvngx_api_min.h (written-out ABI subset, no NVIDIA SDK source); the test drives the pure functions
+  # and the parameter-bag assembly through a recording mock, so it needs no DXGI/D3D12 and no NGX Core.
+  add_executable(dlss_backend_test
+    test/dlss_backend_unit_test.cpp
+    src/dlss_backend.cpp
+  )
+  target_include_directories(dlss_backend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(dlss_backend_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dlss_backend_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dlss_backend_test PRIVATE /OPT:NOREF)
+  add_test(NAME dlss_backend COMMAND dlss_backend_test)
+
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
   target_include_directories(api_ref_state_test PRIVATE
