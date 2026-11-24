@@ -254,6 +254,20 @@ class RuntimePackagingTest(unittest.TestCase):
         env = dict(os.environ, WINE=sys.executable)
         env.pop("LEONIDA_D3D12", None)
         env.pop("LEONIDA_SHADERS", None)
+        path_file = os.path.join(self.out, "game_path.txt")
+        with open(path_file, "rb") as f:
+            path_bytes = f.read()
+        with open(os.path.join(self.root, image), "wb"), open(path_file, "wb"):
+            pass
+        empty_path = subprocess.run([launcher, "--run"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(empty_path.returncode, 1)
+        self.assertIn("Missing package path", empty_path.stderr)
+        with open(path_file, "wb") as f:
+            f.write(path_bytes)
+        unresolved = subprocess.run([launcher, "--run", "other.exe"], cwd=self.root,
+                                    env=dict(env, PATH=self.root), capture_output=True, text=True)
+        self.assertEqual(unresolved.returncode, 1)
+        self.assertIn("Could not resolve runtime launcher", unresolved.stderr)
         missing = subprocess.run([launcher, "--run"], cwd=self.root, env=env, capture_output=True, text=True)
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn(image, missing.stderr)
@@ -271,6 +285,16 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertEqual(json.loads(result)[2:], ["D:/custom", "trace"])
         result = subprocess.check_output([launcher, "--run", "other.exe", "--", "two words"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[:2], [self.root, ["--run", "other.exe", "--", "two words"]])
+        result = subprocess.check_output(
+            [launcher, "--packaged", "--run", "--trace", "Z:/trace file.jsonl", "--", "two words"],
+            cwd=self.root, env=env)
+        self.assertEqual(json.loads(result)[:2], [
+            self.game, ["--run", "./" + image, "--overlay", "Z:" + self.out + "/overlay",
+                        "--trace", "Z:/trace file.jsonl", "--", "two words"],
+        ])
+        invalid = subprocess.run([launcher, "--packaged"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("Use --packaged", invalid.stderr)
 
         work = os.path.join(self.out, "Shader cache '$HOME'")
         make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)

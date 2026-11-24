@@ -160,8 +160,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             root = Path(tmp)
             vs_empty = root / "vs_empty"
             msys_dir = root / "msys_bin"
-            native_cmake_dir = root / "native_cmake_bin"
-            native_ninja_dir = root / "native_ninja_bin"
+            native_cmake_dir = root / "native [cmake] bin"
+            native_ninja_dir = root / "native [ninja] bin"
             for d in (vs_empty, msys_dir, native_cmake_dir, native_ninja_dir):
                 d.mkdir()
 
@@ -194,7 +194,7 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             self.assertEqual(ninja, "")
 
             # 4) VS bundled CMake + Ninja present -> must prefer VS over PATH.
-            vs_full = root / "vs_full"
+            vs_full = root / "vs [full]"
             vs_cmake = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "CMake" / "bin" / "cmake.exe"
             vs_ninja = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.exe"
             vs_cmake.parent.mkdir(parents=True)

@@ -25,7 +25,14 @@ class Recorder {
             for (int i = 0; i + 1 < args.Length; ++i)
                 if (args[i] == "-S" && !Directory.Exists(args[i + 1])) return 9;
         }
-        return Environment.GetEnvironmentVariable("LEONIDA_CMAKE_FAIL") == stage ? 7 : 0;
+        string fail = Environment.GetEnvironmentVariable("LEONIDA_CMAKE_FAIL");
+        if (fail == stage) return 7;
+        if (build) {
+            File.WriteAllText(Path.Combine(args[1], "gta6rt.exe"), "synthetic runtime");
+            if (fail != "missing-tls")
+                File.WriteAllText(Path.Combine(args[1], "gta6rt_tls_host.dll"), "synthetic TLS host");
+        }
+        return 0;
     }
 }
 '''
@@ -112,6 +119,15 @@ class CMakeBatchTest(unittest.TestCase):
                             else:
                                 self.assertEqual(built.read_text(encoding="utf-8-sig").splitlines(),
                                                  ["--build", str(out), "-j", "3"])
+
+    def test_build_without_the_tls_host_is_reported_as_failed(self):
+        with tempfile.TemporaryDirectory(dir=self.base) as tmp:
+            result, _, out, _ = self.run_build(Path(tmp), ".exe", "missing-tls")
+            self.assertTrue((out / "gta6rt.exe").is_file())
+            self.assertEqual(result.returncode, 1, (result.stdout + result.stderr).decode(errors="replace"))
+            self.assertIn(b"The runtime build did not produce", result.stderr)
+            self.assertIn(b"gta6rt_tls_host.dll", result.stderr)
+            self.assertNotIn(b"built ", result.stdout)
 
 
 if __name__ == "__main__":

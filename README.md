@@ -234,6 +234,8 @@ skips the build on Windows.
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.
+To use the packaged image with extra runtime options, add `--packaged` before the mode. For example,
+run `<out>/gta6rt.sh --packaged --run --trace "Z:$PWD/startup.jsonl"` to record startup in your current directory.
 
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.

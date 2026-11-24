@@ -25,9 +25,10 @@ function Invoke-ToolProbe([string]$Exe, [string[]]$ProbeArgs) {
 }
 
 function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$Validate) {
-    if ($Preferred -and (Test-Path $Preferred)) { return $Preferred }
+    if ($Preferred -and (Test-Path -LiteralPath $Preferred -PathType Leaf)) { return $Preferred }
     foreach ($cmd in @(Get-Command $CommandName -CommandType Application -All -ErrorAction SilentlyContinue)) {
-        if ($cmd.Source -and ($cmd.Source -match "\.(exe|cmd|bat)$") -and (Test-Path $cmd.Source) -and (& $Validate $cmd.Source)) {
+        if ($cmd.Source -and ($cmd.Source -match "\.(exe|cmd|bat)$") -and
+            (Test-Path -LiteralPath $cmd.Source -PathType Leaf) -and (& $Validate $cmd.Source)) {
             return $cmd.Source
         }
     }
@@ -169,4 +170,10 @@ while (-not $p.HasExited) {
 Emit-NewLogLines -Offset ([ref]$outOff) -Path $stdoutLog
 Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog
 if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode))" }
+foreach ($artifact in @("gta6rt.exe", "gta6rt_tls_host.dll")) {
+    $built = Join-Path $out $artifact
+    if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
+        throw "The runtime build did not produce $built."
+    }
+}
 Write-Output "built $out\gta6rt.exe"
