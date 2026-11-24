@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "shims.h"
 
@@ -164,6 +165,61 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// LEONIDA_TRACE_MEMDUMP (diagnostic, with --trace): an exception event (not a debug string) also carries the
+// general registers and the readable memory around each of them, the first 0x400 bytes of the stack, and the memory
+// that pointers found there name (two levels), as "mem":[{"at":..,"q":[qwords]}]. For heap corruption, where the
+// faulting thread's minidump holds the stack but not the heap.
+inline bool readable_range(uint64_t start, size_t size) {
+    if (start < 0x10000 || start > UINT64_MAX - size) return false;
+    for (uint64_t at = start; at < start + size;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return false;
+        at = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
+inline std::string memdump_fields(const CONTEXT& c) {
+    static const bool on = GetEnvironmentVariableW(L"LEONIDA_TRACE_MEMDUMP", nullptr, 0) != 0;
+    if (!on) return {};
+    const uint64_t regs[] = {c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi,
+                             c.R8,  c.R9,  c.R10, c.R11, c.R12, c.R13, c.R14, c.R15};
+    static const char* const names[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                                        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+    std::string out = ",\"regs\":{";
+    for (int i = 0; i < 16; ++i) out += (i ? "," : "") + std::string("\"") + names[i] + "\":" + quote(hex(regs[i]));
+    out += "},\"mem\":[";
+    std::set<uint64_t> done;
+    int regions = 0;
+    std::vector<uint64_t> next;
+    auto dump = [&](uint64_t at, size_t size, int depth) {
+        at &= ~uint64_t{7};
+        if (regions >= 600 || !done.insert(at).second || !readable_range(at, size)) return;
+        const auto* q = reinterpret_cast<const uint64_t*>(at);
+        out += (regions++ ? ",{" : "{") + std::string("\"at\":") + quote(hex(at)) + ",\"d\":" +
+               std::to_string(depth) + ",\"q\":[";
+        for (size_t k = 0; k < size / 8; ++k) {
+            out += (k ? ",\"" : "\"") + hex(q[k]).substr(2) + "\"";
+            if (depth < 3 && q[k] >= 0x10000 && q[k] < 0x0000800000000000ull) next.push_back(q[k]);
+        }
+        out += "]}";
+    };
+    for (int i = 0; i < 16; ++i)
+        if (i != 4) dump(regs[i] - 0x80, 0x180, 1);
+    dump(c.Rsp, 0x400, 1);
+    for (int depth = 2; depth <= 3; ++depth) {
+        std::vector<uint64_t> level;
+        level.swap(next);
+        for (uint64_t p : level) dump(p - 0x40, 0x100, depth);
+    }
+    out += "]";
+    return out;
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -185,6 +241,7 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
+            if (info.ContextRecord && r.ExceptionCode != kCppException) f += memdump_fields(*info.ContextRecord);
             event("exception", f);
         }
     } catch (...) {

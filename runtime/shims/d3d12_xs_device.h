@@ -168,6 +168,11 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
 // Translates a CPU descriptor handle from a title-backed descriptor heap to the underlying PC/Vulkan heap handle.
 // Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+// A layer whose CPU descriptor handles are addresses of its heap storage says so; title-backed heaps then mirror.
+void set_descriptor_handles_are_memory(bool yes);
+// Copies `bytes` at a layer heap address from the title-backed heap's backing at the same offset (clamped to the
+// heap); nothing when the address is in no mirrored title-backed heap.
+void pull_title_descriptors(SIZE_T real_ptr, SIZE_T bytes);
 
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
@@ -187,6 +192,23 @@ inline constexpr UINT kLinearTextureLayout = 0x100;
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+
+// Committed textures (device slots 27, 53, 76 and 127) are Vulkan images on the PC device's memory. On the console
+// they are plain memory the title maps (ID3D12Resource::Map) and writes in the console layout, so the title's own
+// description (with its layout word) goes to this handler, which the Vulkan layer registers
+// (rt::d3d12::attach_console_texture). With none registered nothing is done.
+using ConsoleTextureHandler = void (*)(void* resource, const D3D12_RESOURCE_DESC& console_desc);
+void set_console_texture_handler(ConsoleTextureHandler handler);
+
+// True on a thread while the proxy makes a resource for the title (device slots 27, 53, 76, 127 and 133). The device
+// behind it reads this to give a texture the console's format freedom: the console views a typed RGBA8/BGRA8
+// texture as UNORM or SRGB with no castable list (the retail title's 3840x2160 SRGB target takes a UNORM RTV).
+bool in_console_resource_creation();
+
+// Diagnostics: for GPU descriptor handle `gpu` inside a title-backed shader-visible heap (one whose backing came from
+// the title's XMem hook), that descriptor's address in the title's backing and in the layer's heap, and the layer's
+// increment. False when no title-backed heap holds it.
+bool debug_title_descriptor(std::uint64_t gpu, const void** title, const void** layer, UINT* stride);
 
 // Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
 // rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but

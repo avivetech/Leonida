@@ -140,6 +140,8 @@ struct DescriptorRange {
     const HeapProxy* heap;
     UINT stride;  // the layer's descriptor increment for the heap's type (slot 15), which sized the backing
     bool mirror;  // the layer's handles in the range are readable memory: device writes are copied to the backing
+    std::uint64_t gpu_start = 0;  // the layer's GPU handle of descriptor 0 (shader-visible heaps), else 0
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
 };
 
 // Constant-initialized and immortal: no function-local static guard on a title thread (#7957), and late COM Release
@@ -186,27 +188,72 @@ bool readable_memory(SIZE_T start, SIZE_T size) {
     return true;
 }
 
+// Set by a layer whose CPU descriptor handles are addresses of its heap storage (the Vulkan layer): its shader-visible
+// heaps live in mapped GPU memory, which VirtualQuery under Wine does not report as committed.
+std::atomic<bool> g_handles_are_memory{false};
+
 bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
                                SIZE_T byte_size, SIZE_T real_start, UINT stride) {
     if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
         return false;
-    const bool mirror = stride != 0 && byte_size % stride == 0 && readable_memory(real_start, byte_size);
+    const bool mirror = stride != 0 && byte_size % stride == 0 &&
+                        (g_handles_are_memory.load(std::memory_order_acquire) || readable_memory(real_start, byte_size));
     if (!mirror) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[rt] d3d12_xs: a title-backed descriptor heap's layer handles are not readable "
                                  "memory; device writes into it are not copied to the title's backing\n");
     }
+    DescriptorRange range{custom_start, custom_start + byte_size, real_start, device, heap, stride, mirror};
+    if (heap && heap->real && heap->real_vtable) {
+        using DescFn = D3D12_DESCRIPTOR_HEAP_DESC*(WINAPI*)(ID3D12DescriptorHeap*, D3D12_DESCRIPTOR_HEAP_DESC*);
+        reinterpret_cast<DescFn>(heap->real_vtable[8])(heap->real, &range.desc);
+        if (range.desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+            constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
+            D3D12_GPU_DESCRIPTOR_HANDLE handle{kUnset};
+            using GpuFn = D3D12_GPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*);
+            const D3D12_GPU_DESCRIPTOR_HANDLE returned =
+                reinterpret_cast<GpuFn>(heap->real_vtable[10])(heap->real, &handle);
+            range.gpu_start = handle.ptr != kUnset ? handle.ptr : returned.ptr;
+        }
+    }
+    static std::atomic<int> logged_heaps{0};
+    if (logged_heaps.fetch_add(1, std::memory_order_relaxed) < 32)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: title-backed heap: type=%u num=%u flags=0x%x title=0x%llx+0x%llx layer cpu=0x%llx "
+                     "gpu=0x%llx stride=%u mirror=%d\n",
+                     unsigned(range.desc.Type), range.desc.NumDescriptors, unsigned(range.desc.Flags),
+                     static_cast<unsigned long long>(custom_start), static_cast<unsigned long long>(byte_size),
+                     static_cast<unsigned long long>(real_start), static_cast<unsigned long long>(range.gpu_start),
+                     stride, mirror ? 1 : 0);
     try {
         std::lock_guard lock(descriptor_range_mutex());
-        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap, stride,
-                                       mirror});
+        descriptor_ranges().push_back(range);
         g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
         return true;
     } catch (const std::bad_alloc&) {
         return false;
     }
 }
+
+}  // namespace
+
+bool debug_title_descriptor(std::uint64_t gpu, const void** title, const void** layer, UINT* stride) {
+    if (g_custom_range_count.load(std::memory_order_acquire) == 0) return false;
+    std::lock_guard lock(descriptor_range_mutex());
+    for (const DescriptorRange& r : descriptor_ranges()) {
+        if (!r.gpu_start || gpu < r.gpu_start) continue;
+        const std::uint64_t offset = gpu - r.gpu_start;
+        if (offset >= r.custom_end - r.custom_start) continue;
+        if (title) *title = reinterpret_cast<const void*>(r.custom_start + offset);
+        if (layer) *layer = reinterpret_cast<const void*>(r.real_start + offset);
+        if (stride) *stride = r.stride;
+        return true;
+    }
+    return false;
+}
+
+namespace {
 
 void unregister_descriptor_range(const HeapProxy* heap) {
     if (g_custom_range_count.load(std::memory_order_acquire) == 0) return;
@@ -387,6 +434,28 @@ void mirror_title_descriptors(const DeviceProxy* device, SIZE_T title_ptr, UINT 
         std::memcpy(reinterpret_cast<void*>(title_ptr),
                     reinterpret_cast<const void*>(it->real_start + (title_ptr - it->custom_start)),
                     wanted < room ? wanted : room);
+        return;
+    }
+}
+
+// The title-written direction of the mirror: the GPU reads the layer's heap, the title stores descriptors into its
+// backing with the CPU, so a bound table's span is copied from the backing before the submission that reads it.
+void pull_title_descriptors_locked(SIZE_T real_ptr, SIZE_T bytes) {
+    for (auto it = descriptor_ranges().rbegin(); it != descriptor_ranges().rend(); ++it) {
+        const SIZE_T size = it->custom_end - it->custom_start;
+        if (real_ptr < it->real_start || real_ptr - it->real_start >= size) continue;
+        if (!it->mirror) return;
+        const SIZE_T off = real_ptr - it->real_start;
+        if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+            static std::atomic<int> left{400};
+            if (left.fetch_sub(1) > 0) {
+                const auto* d = reinterpret_cast<const std::uint32_t*>(it->custom_start + off);
+                std::fprintf(stderr, "[red] pull off=%llx bytes=%llu backing: %x %x %x %x %x %x %x %x\n",
+                             (unsigned long long)off, (unsigned long long)bytes, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+            }
+        }
+        std::memcpy(reinterpret_cast<void*>(real_ptr), reinterpret_cast<const void*>(it->custom_start + off),
+                    bytes < size - off ? bytes : size - off);
         return;
     }
 }
@@ -1700,6 +1769,20 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
             }
         }
     }
+    if (plane_count > 0 && plane_arr && plane_arr[0].ResourceCount && plane_arr[0].ppResources &&
+        plane_arr[0].ppResources[0]) {
+        static std::atomic<ID3D12Resource*> last_logged{nullptr};
+        ID3D12Resource* const res0 = plane_arr[0].ppResources[0];
+        if (last_logged.exchange(res0, std::memory_order_relaxed) != res0) {
+            static std::atomic<int> described{0};
+            if (described.fetch_add(1, std::memory_order_relaxed) < 8) {
+                const D3D12_RESOURCE_DESC d = res0->GetDesc();
+                std::fprintf(stderr, "[rt] d3d12_xs: PresentX plane resource %p id=0x%llx: fmt=%u %llux%u flags=0x%x\n",
+                             static_cast<void*>(res0), static_cast<unsigned long long>(rt::d3d12::resource_id(res0)),
+                             unsigned(d.Format), static_cast<unsigned long long>(d.Width), d.Height, unsigned(d.Flags));
+            }
+        }
+    }
     const HRESULT hr = state->xbox->PresentX(static_cast<UINT>(plane_count), plane_arr, present_params);
     static std::atomic<std::uint64_t> present_calls{0};
     static std::atomic<std::uint64_t> present_ok{0};
@@ -2309,7 +2392,37 @@ const char* list_tail_name(unsigned slot, unsigned char console_layout) {
 void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
                     unsigned char console_layout = 0) {
     if (slot >= kListSlots) return;
-    ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t hit = ListStats::hits[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+    // LEONIDA_DRAW_TALLY=1: steady-state calls 200-203 of a slot the proxy does not forward, with the 32 bytes each
+    // pointer-like argument names, to measure what the console-only methods carry.
+    static const bool tally = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("LEONIDA_DRAW_TALLY", v, sizeof v) > 0 && v[0] != '0';
+    }();
+    if (tally && hit >= 200 && hit <= 203 && console_to_pc_list_slot(slot) == kListNotForwarded) {
+        const std::uint64_t args[4] = {a1, a2, a3, a4};
+        std::string out;
+        char buf[64];
+        for (int i = 0; i < 4; ++i) {
+            std::snprintf(buf, sizeof buf, " a%d=0x%llx", i + 1, static_cast<unsigned long long>(args[i]));
+            out += buf;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (args[i] >= 0x10000 && args[i] < 0x800000000000ull &&
+                VirtualQuery(reinterpret_cast<const void*>(args[i]), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+                !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                args[i] + 32 <= reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize) {
+                const auto* w = reinterpret_cast<const std::uint32_t*>(args[i]);
+                out += "[";
+                for (int k = 0; k < 8; ++k) {
+                    std::snprintf(buf, sizeof buf, "%s%08x", k ? " " : "", w[k]);
+                    out += buf;
+                }
+                out += "]";
+            }
+        }
+        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u call %llu:%s\n", slot, static_cast<unsigned long long>(hit),
+                     out.c_str());
+    }
     bool expected = false;
     if (ListStats::first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         const char* name = list_tail_name(slot, console_layout);
@@ -3076,6 +3189,25 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     note_slot(70);
     log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
     if (!destination) return;
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+        static std::atomic<int> left{300};
+        if (left.fetch_sub(1) > 0 && readable(texture_words, sizeof(D3D12_RESOURCE_DESC)) &&
+            readable(view_desc, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + 8)) {
+            D3D12_RESOURCE_DESC r{};
+            D3D12_SHADER_RESOURCE_VIEW_DESC w{};
+            std::uint64_t va = 0;
+            std::memcpy(&r, reinterpret_cast<const void*>(texture_words), sizeof(r));
+            std::memcpy(&w, reinterpret_cast<const void*>(view_desc), sizeof(w));
+            std::memcpy(&va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(w), 8);
+            const auto* tw = reinterpret_cast<const std::uint32_t*>(texture_words);
+            std::fprintf(stderr, "[red] s70 dst=%llx res dim=%u w=%llu h=%u d=%u mips=%u fmt=%u | view fmt=%u dim=%u map=%x | "
+                                 "va=%llx | tw %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                         (unsigned long long)destination, unsigned(r.Dimension), (unsigned long long)r.Width, r.Height,
+                         unsigned(r.DepthOrArraySize), unsigned(r.MipLevels), unsigned(r.Format), unsigned(w.Format),
+                         unsigned(w.ViewDimension), w.Shader4ComponentMapping, (unsigned long long)va, tw[0], tw[1], tw[2],
+                         tw[3], tw[4], tw[5], tw[6], tw[7], tw[8], tw[9], tw[10], tw[11]);
+        }
+    }
     // The console's CPU handle may be in a title-backed heap (#7021): translated before either write below.
     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
 
@@ -3309,8 +3441,27 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(17);
-    self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+    const D3D12_CPU_DESCRIPTOR_HANDLE layer = translate_cpu_handle(self, dest);
+    self->real->CreateConstantBufferView(desc, layer);
     mirror_title_descriptors(self, dest.ptr, 1);
+    static const bool tally = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("LEONIDA_DRAW_TALLY", v, sizeof v) > 0 && v[0] != '0';
+    }();
+    if (tally) {
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t n = ++calls;
+        if (n <= 6 || (n >= 2000 && n <= 2012)) {
+            const auto* t = reinterpret_cast<const std::uint32_t*>(dest.ptr);
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 17 CBV #%llu dest=0x%llx layer=0x%llx va=0x%llx size=%u title now: %08x %08x "
+                         "%08x %08x\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(dest.ptr),
+                         static_cast<unsigned long long>(layer.ptr),
+                         static_cast<unsigned long long>(desc ? desc->BufferLocation : 0), desc ? desc->SizeInBytes : 0,
+                         t[0], t[1], t[2], t[3]);
+        }
+    }
 }
 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
@@ -3347,6 +3498,23 @@ void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D
     mirror_title_descriptors(self, dest.ptr, 1);
 }
 
+// A copy source in a title-backed heap whose device writes are mirrored is read from the title's backing: that is
+// where the title's own CPU stores land, and the mirror keeps the layer's writes there too.
+D3D12_CPU_DESCRIPTOR_HANDLE copy_source_handle(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (handle.ptr == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return handle;
+    {
+        std::lock_guard lock(descriptor_range_mutex());
+        const auto& ranges = descriptor_ranges();
+        for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+            if (device && it->device != device) continue;
+            if (handle.ptr < it->custom_start || handle.ptr >= it->custom_end) continue;
+            if (it->mirror) return handle;
+            break;
+        }
+    }
+    return translate_cpu_handle(device, handle);
+}
+
 void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
                             const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
                             const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -3378,7 +3546,7 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
                 src_heap.resize(num_src);
                 src = src_heap.data();
             }
-            for (UINT i = 0; i < num_src; ++i) src[i] = translate_cpu_handle(self, src_starts[i]);
+            for (UINT i = 0; i < num_src; ++i) src[i] = copy_source_handle(self, src_starts[i]);
             src_out = src;
         }
     } catch (const std::bad_alloc&) {
@@ -3394,8 +3562,14 @@ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DE
 void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
                                    D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     note_slot(24);
+    if (const char* v = std::getenv("LEONIDA_RED_DIAG"); v && *v && *v != '0') {
+        static std::atomic<int> left{300};
+        if (left.fetch_sub(1) > 0)
+            std::fprintf(stderr, "[red] s24 n=%u dst=%llx src=%llx type=%u\n", num_descriptors,
+                         (unsigned long long)dest_start.ptr, (unsigned long long)src_start.ptr, unsigned(type));
+    }
     self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
-                                      translate_cpu_handle(self, src_start), type);
+                                      copy_source_handle(self, src_start), type);
     mirror_title_descriptors(self, dest_start.ptr, num_descriptors);
 }
 
@@ -3655,6 +3829,17 @@ struct XmemBackingOwner final : IUnknown {
 // whose memory comes from the title's XMem hook are made on that memory through the same handler.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
 PlacedAtVaHandler placed_at_va_handler() { return g_placed_at_va.load(std::memory_order_acquire); }
+// set_console_texture_handler: the Vulkan layer's rt::d3d12::attach_console_texture.
+std::atomic<ConsoleTextureHandler> g_console_texture{nullptr};
+
+// in_console_resource_creation: a count, as creation paths may nest (slot 133's texture is a committed one).
+thread_local int g_console_creation = 0;
+struct ConsoleCreationScope {
+    ConsoleCreationScope() { ++g_console_creation; }
+    ~ConsoleCreationScope() { --g_console_creation; }
+    ConsoleCreationScope(const ConsoleCreationScope&) = delete;
+    ConsoleCreationScope& operator=(const ConsoleCreationScope&) = delete;
+};
 
 struct XmemHooks {
     DescriptorHeapBackingAlloc alloc = nullptr;
@@ -3744,10 +3929,22 @@ constexpr std::uint32_t kHeapFlagsNotOnTitleMemory = D3D12_HEAP_FLAG_SHARED | D3
 // A texture stays on the PC device's memory and the hook memory is bookkeeping only: the console lays a texture out in
 // its own tiling, which no Vulkan image on imported host memory reproduces, so the title's CPU view of those bytes
 // could not match the image anyway.
-template <class CreatePc>
+//
+// `console_desc` is the title's own description (its console layout word included), handed with a texture that was
+// made to the console texture handler (set_console_texture_handler), so that Map works on it as on the console.
+template <class CreatePcResource>
 HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uint32_t heap_flags,
                                       const D3D12_RESOURCE_DESC& desc, const IID& riid, void** out,
-                                      CreatePc&& create_pc) {
+                                      const D3D12_RESOURCE_DESC* console_desc, CreatePcResource&& create_pc_resource) {
+    const auto create_pc = [&]() -> HRESULT {
+        const ConsoleCreationScope console;
+        const HRESULT made = create_pc_resource();
+        if (SUCCEEDED(made) && out && *out && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (const ConsoleTextureHandler attach = g_console_texture.load(std::memory_order_acquire))
+                attach(*out, console_desc ? *console_desc : desc);
+        }
+        return made;
+    };
     const XmemHooks hooks = xmem_hooks();
     if (!hooks.alloc) return create_pc();
     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
@@ -3835,7 +4032,8 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                      "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
-    return create_committed_through_xmem(self, 76, static_cast<std::uint32_t>(heap_flags), pc_desc, *riid, out, [&] {
+    return create_committed_through_xmem(self, 76, static_cast<std::uint32_t>(heap_flags), pc_desc, *riid, out,
+                                         xbox_desc, [&] {
         return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
                                                    *riid, out);
     });
@@ -3872,7 +4070,7 @@ HRESULT proxy_create_committed_resource_pc(DeviceProxy* self, const D3D12_HEAP_P
     if (!out || !desc || !riid) return forward();  // a capability check or an argument error: the PC runtime's answer
     *out = nullptr;
     return create_committed_through_xmem(self, kPcCreateCommittedResource, static_cast<std::uint32_t>(heap_flags),
-                                         *desc, *riid, out, forward);
+                                         *desc, *riid, out, desc, forward);
 }
 
 HRESULT proxy_create_committed_resource1_pc(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
@@ -3891,7 +4089,7 @@ HRESULT proxy_create_committed_resource1_pc(DeviceProxy* self, const D3D12_HEAP_
     if (!out || !desc || !riid) return forward();
     *out = nullptr;
     return create_committed_through_xmem(self, kPcCreateCommittedResource1, static_cast<std::uint32_t>(heap_flags),
-                                         *desc, *riid, out, forward);
+                                         *desc, *riid, out, desc, forward);
 }
 
 // Xbox device slot 127 (RT-5 stop 15, measured by Pipodi in #6982): the argument list of ID3D12Device10::
@@ -3961,8 +4159,10 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 #endif
     if (!device10) return E_NOTIMPL;
     const auto create = reinterpret_cast<Fn>((*reinterpret_cast<void***>(device10))[kPcCreateCommittedResource3]);
+    const D3D12_RESOURCE_DESC console_desc = desc_of(*xbox_desc);
     const HRESULT hr = create_committed_through_xmem(
-        self, kCreateCommittedResource3X, static_cast<std::uint32_t>(heap_flags), desc_of(pc_desc), *riid, out, [&] {
+        self, kCreateCommittedResource3X, static_cast<std::uint32_t>(heap_flags), desc_of(pc_desc), *riid, out,
+        &console_desc, [&] {
             return create(static_cast<ID3D12Device*>(device10),
                           reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
                           static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
@@ -4030,7 +4230,11 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                          va, static_cast<unsigned long long>(pc_desc.Width), GetLastError());
         }
     }
-    const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
+    HRESULT hr = E_FAIL;
+    {
+        const ConsoleCreationScope console;
+        hr = handler(self->real, va, pc_desc, state, *riid, out);
+    }
     if (FAILED(hr)) {
         static std::atomic<int> logged_fail{0};
         if (logged_fail.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -4045,6 +4249,12 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     }
     if (SUCCEEDED(hr) && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && *out)
         remember_placed_buffer(self, reinterpret_cast<std::uintptr_t>(va), pc_desc.Width, *out);
+    // A texture at the title's VA: on the console Map hands out that memory, laid out as the title's description
+    // says (its layout word included), and the title writes its texels there.
+    if (SUCCEEDED(hr) && pc_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && *out) {
+        if (const ConsoleTextureHandler attach = g_console_texture.load(std::memory_order_acquire))
+            attach(*out, *xbox_desc);
+    }
     return hr;
 }
 
@@ -4709,6 +4919,14 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
     g_heap_free = free;
 }
 
+void set_descriptor_handles_are_memory(bool yes) { g_handles_are_memory.store(yes, std::memory_order_release); }
+
+void pull_title_descriptors(SIZE_T real_ptr, SIZE_T bytes) {
+    if (real_ptr == 0 || bytes == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    pull_title_descriptors_locked(real_ptr, bytes);
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     const auto* proxy = is_device_proxy(device) ? static_cast<const DeviceProxy*>(device) : nullptr;
     return translate_cpu_handle(proxy, handle);
@@ -4722,6 +4940,12 @@ unsigned device_proxy_slot_count(const void* device) {
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
+
+void set_console_texture_handler(ConsoleTextureHandler handler) {
+    g_console_texture.store(handler, std::memory_order_release);
+}
+
+bool in_console_resource_creation() { return g_console_creation > 0; }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);

@@ -231,6 +231,9 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // what the GPU reads. For a shader-readable linear 2D texture, the image holds a copy of the initial texels.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
+// A committed texture an Xbox title made (device slots 27, 53, 76, 127) takes the title's own description, with its
+// console layout word: Map then hands out memory in the console layout and uploads what the title writes there.
+void attach_console_texture(void* resource, const D3D12_RESOURCE_DESC& console_desc);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 
@@ -441,6 +444,11 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
+
+// Diagnostics only (LEONIDA_DRAW_TALLY's draw dump): the Vulkan device's arena host mapping, where shader addresses
+// (offsets from heap_base) can be read back on the CPU.
+inline std::atomic<const std::uint8_t*> g_debug_arena_host{nullptr};
+inline std::atomic<std::uint64_t> g_debug_arena_size{0};
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

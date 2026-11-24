@@ -27,8 +27,10 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/debug_probe.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
+#include "../src/xg_layout.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
@@ -208,6 +210,34 @@ void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t by
             std::memset(to + at, 0, run);
         at += run;
     }
+}
+
+// True the first time `key` is passed: for lines logged once per distinct text (a setting, a probed pipeline).
+bool first_time(const std::string& key) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    return seen.insert(key).second;
+}
+
+// LEONIDA_PROBE's settings (src/debug_probe.h). Read for every graphics pipeline, so a test can change them between
+// pipelines; a value that is not understood is logged once.
+leonida::DebugProbe debug_probe_from_env() {
+    const auto read = [](const char* name) {
+        std::string value;
+        char* text = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&text, &length, name) == 0 && text) value = text;
+        std::free(text);
+        return value;
+    };
+    const std::string probe = read("LEONIDA_PROBE");
+    if (probe.empty()) return {};
+    const std::string mode = read("LEONIDA_PROBE_MODE"), pos = read("LEONIDA_PROBE_POS");
+    leonida::DebugProbe settings = leonida::parse_debug_probe(probe.c_str(), mode.c_str(), pos.c_str());
+    if (!settings.problem.empty() && first_time(settings.problem))
+        std::fprintf(stderr, "[rt] d3d12: %s\n", settings.problem.c_str());
+    return settings;
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -718,6 +748,27 @@ std::filesystem::path configured_shader_directory() {
 }
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
+// LEONIDA_CAPTURE_FSSM=<dir>: writes the bytecode (container) of each graphics stage whose FSSM program the shader
+// library has no translation for, once per program, as <stage>_<fssm sha>.bin, so it can be translated offline into
+// <spirv>/captured/ (the title builds some programs outside the archives the shaders stage carves). Off by default.
+void capture_untranslated_graphics(const char* stage, const std::string& hash, const D3D12_SHADER_BYTECODE& code) {
+    if (!code.pShaderBytecode || !code.BytecodeLength) return;
+    char dir[MAX_PATH];
+    size_t length = 0;
+    if (getenv_s(&length, dir, sizeof dir, "LEONIDA_CAPTURE_FSSM") != 0 || length <= 1) return;
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    const std::string name = std::string(stage) + "_" + hash;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert(name).second) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream out(std::filesystem::path(dir) / (name + ".bin"), std::ios::binary);
+    out.write(static_cast<const char*>(code.pShaderBytecode), std::streamsize(code.BytecodeLength));
+    std::fprintf(stderr, "[rt] d3d12: LEONIDA_CAPTURE_FSSM: captured %s (%zu bytes)\n", name.c_str(),
+                 static_cast<std::size_t>(code.BytecodeLength));
+}
+
 struct DeviceState {
     VulkanDeviceInfo info;
     std::vector<std::uint32_t> families;
@@ -834,7 +885,23 @@ struct DeviceState {
             }
         }
         refresh_linear_textures();
+        refresh_console_textures();
     }
+
+    // Console textures the title maps (Resource::console_map, Xbox device slots 27/53/76/127): the console's
+    // committed texture is plain memory the CPU writes in the console layout. Each one the title has mapped is
+    // uploaded from that memory before the next submission while it is dirty. Defined after Resource.
+    std::mutex console_texture_mutex;
+    std::vector<ID3D12Resource*> console_textures;
+    void add_console_texture(ID3D12Resource* resource) {
+        std::lock_guard lock(console_texture_mutex);
+        console_textures.push_back(resource);
+    }
+    void remove_console_texture(ID3D12Resource* resource) {
+        std::lock_guard lock(console_texture_mutex);
+        std::erase(console_textures, resource);
+    }
+    void refresh_console_textures();
 
     // Live linear slot-133 textures (e.g. 4K Bink2 YUV planes decoded on CPU into XMem linear pages): fingerprinted
     // before each submission and re-uploaded via WriteToSubresource whenever their CPU pages change.
@@ -2263,6 +2330,11 @@ public:
 
     ~Resource() override {
         if (linear_shadow_) device_.remove_linear_shadow(static_cast<ID3D12Resource*>(this));
+        if (console_) {
+            if (console_->registered) device_.remove_console_texture(static_cast<ID3D12Resource*>(this));
+            if (console_->owned && console_->pages) VirtualFree(console_->pages, 0, MEM_RELEASE);
+            for (std::uint8_t* old_pages : console_->retired) VirtualFree(old_pages, 0, MEM_RELEASE);
+        }
         if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
@@ -2891,6 +2963,8 @@ public:
     // address arena.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
     void set_title_va(D3D12_GPU_VIRTUAL_ADDRESS va) { va_ = va; }
+    // A slot-133 texture's own pages at the title's VA: on the console its memory, which Map hands out.
+    void set_title_pages(void* pages) { title_pages_ = static_cast<std::uint8_t*>(pages); }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2929,6 +3003,16 @@ public:
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
+            if (data && console_) return console_map(subresource, read, data);
+            if (data) {
+                static std::atomic<int> refused{0};
+                if (refused.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: Map of a texture with a pointer refused (no console memory): fmt=%u "
+                                 "%llux%u mips=%u heap=%u flags=0x%x\n",
+                                 unsigned(desc_.Format), static_cast<unsigned long long>(desc_.Width), desc_.Height,
+                                 unsigned(desc_.MipLevels), unsigned(heap_.Type), unsigned(desc_.Flags));
+            }
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
                            leonida::image_range(binding_, subresource, range)
@@ -2940,7 +3024,99 @@ public:
         if (data) *data = mapped_;
         return S_OK;
     }
-    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override {}
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE* written) override {
+        if (!console_ || !written || written->End <= written->Begin) return;
+        std::lock_guard lock(console_->mutex);
+        console_->dirty_lo = std::min<std::uint64_t>(console_->dirty_lo, written->Begin);
+        console_->dirty_hi = std::max<std::uint64_t>(console_->dirty_hi, written->End);
+    }
+
+    // A committed texture of an Xbox title (device slots 27, 53, 76 and 127, attach_console_texture): on the console
+    // it is plain memory the CPU maps and writes in the console layout (XG, which the title computes through the
+    // layer's own xg shim), and Map hands out a pointer to it. Here the texture is a Vulkan image, so Map hands out
+    // memory laid out as the console's, made on first use and big enough for the console layout and the range the
+    // title names, and what is written there reaches the image before the next submission (upload_console). Without
+    // this a Map with a pointer was refused, and Scaleform's texture update fell back to an image whose plane the
+    // title sizes as 0 bytes for its float formats and then overran by the whole image (Frame 365 heap corruption).
+    void set_console_desc(const D3D12_RESOURCE_DESC& console_desc) {
+        if (!image_ || console_) return;
+        auto c = std::make_unique<ConsoleTexture>();
+        static_assert(sizeof(leonida::xg::XgResourceDesc) == sizeof(D3D12_RESOURCE_DESC));
+        std::memcpy(&c->desc, &console_desc, sizeof(console_desc));
+        c->layout_ok = leonida::xg::compute_resource_layout(c->desc, c->layout);
+        const auto cf = leonida::xg::dxgi_format_info(std::uint32_t(console_desc.Format));
+        const auto pf = leonida::xg::dxgi_format_info(std::uint32_t(desc_.Format));
+        if (title_pages_) {
+            c->pages = title_pages_;
+            c->size = c->layout_ok ? c->layout.size_bytes : 0;
+            c->owned = false;
+        }
+        c->uploadable = c->layout_ok && c->layout.planes == 1 && cf.bytes_per_element != 0 &&
+                        cf.bytes_per_element == pf.bytes_per_element && cf.block_dim == pf.block_dim &&
+                        desc_.SampleDesc.Count <= 1 && binding_.samples <= 1;
+        console_ = std::move(c);
+    }
+
+    // Before each submission (DeviceState::refresh_console_textures): the subresources whose console bytes lie in
+    // the dirty range, from the console layout (linear rows or GFX10 swizzle) to linear rows, into the image.
+    void upload_console() {
+        if (!console_) return;
+        ConsoleTexture& c = *console_;
+        std::uint64_t lo = 0, hi = 0;
+        {
+            std::lock_guard lock(c.mutex);
+            lo = c.dirty_lo;
+            hi = c.dirty_hi;
+            c.dirty_lo = UINT64_MAX;
+            c.dirty_hi = 0;
+        }
+        if (lo >= hi || !c.pages) return;
+        if (!c.uploadable) {
+            static std::atomic<int> skipped{0};
+            if (skipped.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: console texture not uploaded (console fmt=%u PC fmt=%u layout=0x%x planes=%u "
+                             "xg=%d)\n",
+                             c.desc.format, unsigned(desc_.Format), c.desc.layout, c.layout.planes, c.layout_ok);
+            return;
+        }
+        const bool is_3d = c.desc.dimension == leonida::xg::kDimTexture3D;
+        const std::uint32_t arrays = is_3d ? 1u : std::max<std::uint32_t>(1u, c.desc.depth_or_array_size);
+        const std::uint32_t mips = c.layout.mip_levels;
+        const std::uint32_t pc_mips = desc_.MipLevels ? desc_.MipLevels : mips;
+        const leonida::xg::XgPlaneLayout& plane = c.layout.plane[0];
+        std::vector<std::byte> linear;
+        for (std::uint32_t a = 0; a < arrays; ++a) {
+            for (std::uint32_t m = 0; m < mips && m < pc_mips; ++m) {
+                const leonida::xg::XgMipLevelLayout& ml = plane.mip_layout[m];
+                const std::uint64_t off = plane.base_offset_bytes + std::uint64_t(a) * plane.bytes_per_slice +
+                                          ml.offset_bytes;
+                if (off >= hi || off + ml.size_bytes <= lo) continue;
+                const std::uint32_t z = is_3d ? std::max(1u, ml.depth_or_array) : 1u;
+                const std::uint64_t row = std::uint64_t(ml.width_elements) * plane.bytes_per_element;
+                const std::uint64_t slice = row * ml.height_elements;
+                if (!row || !slice || row > UINT32_MAX || slice > UINT32_MAX) continue;
+                linear.resize(std::size_t(slice * z));
+                const std::uint32_t xg_sub = m + a * mips;
+                if (!leonida::xg::copy_from_subresource(c.desc, c.layout, linear.data(), 0, xg_sub, c.pages,
+                                                        std::uint32_t(row), std::uint32_t(slice))) {
+                    log_once("console texture subresource the xg layout cannot copy; layout", int(c.desc.layout));
+                    continue;
+                }
+                const HRESULT hr = WriteToSubresource(m + a * pc_mips, nullptr, linear.data(), UINT(row), UINT(slice));
+                static std::atomic<int> uploads{0};
+                const int n = uploads.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 8 || !(n & (n - 1)))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: console texture upload #%d: fmt=%u %llux%u mip %u slice %u layout=0x%x "
+                                 "tile=0x%x (%llu bytes at +0x%llx) -> 0x%08x\n",
+                                 n, unsigned(desc_.Format), static_cast<unsigned long long>(desc_.Width),
+                                 desc_.Height, m, a, c.desc.layout, ml.tile_mode,
+                                 static_cast<unsigned long long>(ml.size_bytes),
+                                 static_cast<unsigned long long>(off), unsigned(hr));
+            }
+        }
+    }
 
     // CPU copies into and out of a texture subresource. D3D12 completes them before returning and leaves it to
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
@@ -2959,6 +3135,86 @@ public:
     }
 
 private:
+    struct ConsoleTexture {
+        leonida::xg::XgResourceDesc desc{};
+        leonida::xg::XgResourceLayout layout{};
+        bool layout_ok = false;
+        bool uploadable = false;
+        bool registered = false;
+        bool owned = true;              // false: the title's own pages (a slot-133 texture), never freed here
+        std::uint8_t* pages = nullptr;  // owned: VirtualAlloc'd, page-backed, so an overrun faults instead
+        std::uint64_t size = 0;
+        std::vector<std::uint8_t*> retired;  // smaller pages a later, larger map replaced; freed with the texture
+        std::mutex mutex;
+        std::uint64_t dirty_lo = UINT64_MAX;
+        std::uint64_t dirty_hi = 0;
+    };
+    std::unique_ptr<ConsoleTexture> console_;
+
+    HRESULT console_map(UINT subresource, const D3D12_RANGE* read, void** data) {
+        ConsoleTexture& c = *console_;
+        const bool ranged = read && read->End > read->Begin;
+        bool first = false;
+        {
+            std::lock_guard lock(c.mutex);
+            std::uint64_t want = c.layout_ok ? c.layout.size_bytes : 0;
+            if (ranged) want = std::max<std::uint64_t>(want, read->End);
+            if (!want) {  // no console layout: 16 bytes a texel, twice over for the mip chain
+                const std::uint64_t texels = std::uint64_t(desc_.Width) * std::max(1u, desc_.Height) *
+                                             std::max<std::uint32_t>(1u, desc_.DepthOrArraySize);
+                want = texels <= (UINT64_MAX >> 6) ? texels * 32 : 0;
+            }
+            if (!want) return E_INVALIDARG;
+            if (!c.owned) {
+                if (ranged && c.size && read->End > c.size) {
+                    static std::atomic<int> past{0};
+                    if (past.fetch_add(1, std::memory_order_relaxed) < 4)
+                        std::fprintf(stderr,
+                                     "[rt] d3d12: slot-133 texture mapped past its xg size: range end 0x%llx, xg size "
+                                     "0x%llx\n",
+                                     static_cast<unsigned long long>(read->End), static_cast<unsigned long long>(c.size));
+                }
+                first = !c.registered;
+            } else if (!c.pages || want > c.size) {
+                const std::uint64_t size = (want + 0xFFFF) & ~std::uint64_t{0xFFFF};
+                auto* pages = static_cast<std::uint8_t*>(
+                    VirtualAlloc(nullptr, std::size_t(size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!pages) return E_OUTOFMEMORY;
+                if (c.pages) {
+                    std::memcpy(pages, c.pages, std::size_t(c.size));
+                    c.retired.push_back(c.pages);
+                }
+                first = !c.pages;
+                c.pages = pages;
+                c.size = size;
+            }
+            c.dirty_lo = std::min<std::uint64_t>(c.dirty_lo, ranged ? read->Begin : 0);
+            c.dirty_hi = std::max<std::uint64_t>(c.dirty_hi, ranged ? read->End : c.size);
+            if (!c.registered) {
+                c.registered = true;
+                device_.add_console_texture(static_cast<ID3D12Resource*>(this));
+            }
+            *data = c.pages;
+        }
+        static std::atomic<int> logged{0};
+        if (first && logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            const auto& ml0 = c.layout.plane[0].mip_layout[0];
+            std::fprintf(stderr,
+                         "[rt] d3d12: console texture mapped: PC fmt=%u console fmt=%u %llux%u arr=%u mips=%u "
+                         "layout=0x%x flags=0x%x xg=%d size=0x%llx mip0 +0x%llx 0x%llx pitch %u tile 0x%x; sub %u "
+                         "range [0x%llx, 0x%llx)%s\n",
+                         unsigned(desc_.Format), c.desc.format, static_cast<unsigned long long>(desc_.Width),
+                         desc_.Height, unsigned(c.desc.depth_or_array_size), c.layout.mip_levels, c.desc.layout,
+                         c.desc.flags, c.layout_ok, static_cast<unsigned long long>(c.layout.size_bytes),
+                         static_cast<unsigned long long>(ml0.offset_bytes),
+                         static_cast<unsigned long long>(ml0.size_bytes), ml0.pitch_bytes, ml0.tile_mode,
+                         subresource, static_cast<unsigned long long>(ranged ? read->Begin : 0),
+                         static_cast<unsigned long long>(ranged ? read->End : 0),
+                         c.uploadable ? "" : " (not uploadable)");
+        }
+        return S_OK;
+    }
+
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
     struct Region {
         VkImageSubresourceLayers layers;
@@ -3203,6 +3459,7 @@ private:
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     bool linear_shadow_ = false;
+    std::uint8_t* title_pages_ = nullptr;  // set_title_pages
     bool fallback_alias_ = false;  // also registered at the title's VA as id() | 1 (alias_fallback_va)
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
     bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
@@ -4166,7 +4423,14 @@ public:
                 return !vertex || layout_feeds(e, desc.InputLayout);
             });
             if (!stage.entry) {
-                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                const std::size_t translated = library->candidates(stage.name, hash).size();
+                if (translated)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %zu translated %s for FSSM sha256 %s, none fed by this input layout\n",
+                                 translated, stage.name, hash.c_str());
+                else
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                if (!translated) capture_untranslated_graphics(stage.name, hash, stage.code);
                 return stub_or(E_INVALIDARG, "graphics");
             }
             if (stage.entry->binding_count) {
@@ -4251,6 +4515,49 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        // LEONIDA_PROBE (src/debug_probe.h, docs/boot.md): a debugging switch that gives a pipeline whose shader names
+        // hold the text built-in stages. The title's entries stay the stages' entries, so the input layout, bindings
+        // and subgroup sizes are what they would be; only the words handed to Vulkan change.
+        std::vector<std::uint32_t> probe_vs, probe_ps;
+        if (const leonida::DebugProbe probe = debug_probe_from_env();
+            std::any_of(std::begin(stages), std::end(stages),
+                        [&](const Stage& s) { return s.entry && probe.matches(s.entry->name); })) {
+            std::string vs_note = "kept", ps_note = "kept";
+            if (probe.vertex && vs_stage.bit != VK_SHADER_STAGE_VERTEX_BIT) {
+                vs_note = "kept (a mesh pipeline)";
+            } else if (probe.vertex && gs_stage.entry) {
+                vs_note = "kept (its geometry shader reads it)";
+            } else if (probe.vertex) {
+                // The pass-through reads POSITION0 at its input register; without a float one, the triangle instead.
+                const leonida::SignatureElement* position = nullptr;
+                for (const auto& e : vs_stage.entry->input_signature)
+                    if (!e.system_value && e.semantic_index == 0 && equal_semantic(e.semantic, "POSITION") &&
+                        (e.component_type.empty() || e.component_type == "float"))
+                        position = &e;
+                leonida::DebugProbe vertex_probe = probe;
+                if (probe.position != leonida::DebugProbe::Position::fullscreen && !position)
+                    vertex_probe.position = leonida::DebugProbe::Position::fullscreen;
+                probe_vs = leonida::debug_probe_vertex_words(vertex_probe, position ? position->register_index : 0);
+                if (probe_vs.empty()) return E_FAIL;  // the embedded words lost the shape debug_probe.h patches
+                vs_note = vertex_probe.position == leonida::DebugProbe::Position::fullscreen
+                              ? "full-screen triangle"
+                              : vertex_probe.position == leonida::DebugProbe::Position::ndc ? "POSITION as NDC"
+                                                                                            : "POSITION as pixels";
+                if (vertex_probe.position != probe.position) vs_note += " (no float POSITION0 input)";
+                vs_note += ", culling off";
+            }
+            if (probe.pixel && ps_stage.entry) {
+                probe_ps = leonida::debug_probe_pixel_words();
+                ps_note = "solid green";
+            } else if (probe.pixel) {
+                ps_note = "none to replace";
+            }
+            const auto name = [](const Stage& s) { return s.entry ? s.entry->name : std::string("-"); };
+            const std::string line = "vs " + name(vs_stage) + ", gs " + name(gs_stage) + ", ps " + name(ps_stage) +
+                                     ": vertex shader " + vs_note + ", pixel shader " + ps_note;
+            if (first_time("LEONIDA_PROBE " + line))
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_PROBE: %s\n", line.c_str());
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -4265,6 +4572,8 @@ public:
                     stage.words = std::move(patched);
                 }
             }
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !probe_vs.empty()) stage.words = probe_vs;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT && !probe_ps.empty()) stage.words = probe_ps;
             const VkShaderModule module = device_.shader_modules().acquire(stage.words);
             if (module == VK_NULL_HANDLE) return E_FAIL;
             modules_.push_back(module);
@@ -4402,6 +4711,7 @@ public:
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
                           : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
                                                                : VK_CULL_MODE_NONE;
+        if (!probe_vs.empty()) raster.cullMode = VK_CULL_MODE_NONE;  // the probe's winding is not the title's
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         // The D24-as-D32 pixel stage applies the bias itself, in D24 units (depth24_fragment above): the
@@ -4877,8 +5187,8 @@ private:
         static std::atomic<unsigned> built{0};
         const unsigned n = ++built;
         if (n <= 16 || (n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: lazily compiled graphics pipeline #%u (unbound=0x%x, stages=%zu: %s)\n",
-                         n, unbound, recipe_.stages.size(), recipe_.debug_names.c_str());
+            std::fprintf(stderr, "[rt] d3d12: lazily compiled graphics pipeline #%u id=%p (unbound=0x%x, stages=%zu: %s)\n",
+                         n, reinterpret_cast<void*>(id()), unbound, recipe_.stages.size(), recipe_.debug_names.c_str());
         return pipeline;
     }
 
@@ -5742,6 +6052,8 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_descriptor_handles_are_memory(true);  // title-backed heaps mirror (forge f18e12706)
+        rt::d3d12_xs::set_console_texture_handler(&attach_console_texture);  // console texture Map
         rt::d3d12_xs::set_native_shader_directory_provider(&configured_shader_directory);  // slot 57's containers
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
@@ -6198,6 +6510,8 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        g_debug_arena_host.store(arena.mapped, std::memory_order_release);
+        g_debug_arena_size.store(arena.size, std::memory_order_release);
         arena.free[kArenaReserved] = arena.size - kArenaReserved;
         arena.peak_end = kArenaReserved;
         char log[4] = {};
@@ -7084,7 +7398,19 @@ public:
                 } else if (requested != rd.Format) {
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
-                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) {
+                    log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                    static std::atomic<int> refused{0};
+                    const int n = refused.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 12 || !(n & (n - 1)))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12: RTV #%d refused: view fmt=%u dim=%d on resource fmt=%u %llux%u "
+                                     "arr=%u mips=%u flags=0x%x castable=%d\n",
+                                     n, unsigned(requested), desc ? int(desc->ViewDimension) : -1,
+                                     unsigned(rd.Format), static_cast<unsigned long long>(rd.Width), rd.Height,
+                                     unsigned(rd.DepthOrArraySize), unsigned(rd.MipLevels), unsigned(rd.Flags),
+                                     r && r->has_castable_formats() ? 1 : 0);
+                }
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
@@ -7963,6 +8289,7 @@ public:
         if (SUCCEEDED(hr)) {
             if (auto* r = Resource::from<Resource>(texture)) {
                 r->set_title_va(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+                r->set_title_pages(address);
                 r->mark_linear_shadow();
                 DeviceState::LinearTexShadow s{};
                 s.resource = texture;
@@ -8037,8 +8364,10 @@ public:
                 hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &pc_desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
                                       riid, out);
             if (SUCCEEDED(hr) && out && *out && address) {
-                if (auto* r = Resource::from<Resource>(reinterpret_cast<IUnknown*>(*out)))
+                if (auto* r = Resource::from<Resource>(reinterpret_cast<IUnknown*>(*out))) {
                     r->set_title_va(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+                    r->set_title_pages(address);
+                }
             }
             return d3d12_trace::result(method, hr);
         }
@@ -9408,8 +9737,43 @@ private:
                 log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
             } else {
+                // A console title's typed RGBA8/BGRA8 texture is viewed as UNORM or SRGB with no castable list (the
+                // retail title's 3840x2160 SRGB target takes a UNORM RTV, which was refused and its draws lost):
+                // made for the title (rt::d3d12_xs::in_console_resource_creation), it lists the pair itself.
+                DXGI_FORMAT console_pair[2]{};
+                if (!castable_count && rt::d3d12_xs::in_console_resource_creation()) {
+                    switch (desc->Format) {
+                    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                        console_pair[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        console_pair[1] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                        break;
+                    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                        console_pair[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+                        console_pair[1] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                        break;
+                    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+                        console_pair[0] = DXGI_FORMAT_B8G8R8X8_UNORM;
+                        console_pair[1] = DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+                        break;
+                    default: break;
+                    }
+                    if (console_pair[0] != DXGI_FORMAT_UNKNOWN) {
+                        castable_count = 2;
+                        castable = console_pair;
+                    }
+                }
                 std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
+                if (FAILED(hr) && castable == console_pair) {  // the pair is the layer's own: never refuse over it
+                    static std::atomic<int> refused{0};
+                    if (refused.fetch_add(1, std::memory_order_relaxed) < 4)
+                        std::fprintf(stderr, "[rt] d3d12: console UNORM/SRGB castable pair refused for fmt=%u\n",
+                                     unsigned(desc->Format));
+                    castable_count = 0;
+                    castable = nullptr;
+                    cast_formats.clear();
+                    hr = castable_view_formats(format, desc->Format, 0, nullptr, cast_formats);
+                }
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -9652,6 +10016,25 @@ private:
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
 
+
+// After Resource: uploads the dirty console textures (Resource::upload_console) before a submission.
+void DeviceState::refresh_console_textures() {
+    static thread_local bool in_refresh = false;
+    if (in_refresh) return;
+    std::vector<ID3D12Resource*> work;
+    {
+        std::lock_guard lock(console_texture_mutex);
+        if (console_textures.empty()) return;
+        for (ID3D12Resource* r : console_textures)
+            if (Resource::try_add_ref_iface(r)) work.push_back(r);
+    }
+    in_refresh = true;
+    for (ID3D12Resource* r : work) {
+        if (auto* resource = Resource::from<Resource>(r)) resource->upload_console();
+        r->Release();
+    }
+    in_refresh = false;
+}
 }  // namespace
 
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
@@ -9767,6 +10150,11 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+void attach_console_texture(void* resource, const D3D12_RESOURCE_DESC& console_desc) {
+    if (!resource) return;
+    if (auto* r = Resource::from<Resource>(static_cast<IUnknown*>(resource))) r->set_console_desc(console_desc);
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,

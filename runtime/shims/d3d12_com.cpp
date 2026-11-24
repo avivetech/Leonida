@@ -34,6 +34,19 @@ static D3D12_CPU_DESCRIPTOR_HANDLE layer_handle(D3D12_CPU_DESCRIPTOR_HANDLE hand
     return rt::d3d12_xs::translate_cpu_descriptor_handle(nullptr, handle);
 }
 
+// LEONIDA_DEBUG_CLEAR=1 (docs/boot.md): a bring-up switch that turns every all-zero ClearRenderTargetView into opaque
+// magenta, so a target the frame's draws leave black can be told apart from one no draw reached. Read when a command
+// list is made; the first list made with it says so.
+static bool debug_clear_setting() {
+    char text[8] = {};
+    std::size_t length = 0;
+    const bool on = getenv_s(&length, text, sizeof(text), "LEONIDA_DEBUG_CLEAR") == 0 && length > 1 && text[0] != '0';
+    static std::atomic<bool> logged{false};
+    if (on && !logged.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_DEBUG_CLEAR: all-zero render-target clears are opaque magenta\n");
+    return on;
+}
+
 struct TileGrid {
     std::uint64_t columns = 0;
     std::uint64_t rows = 0;
@@ -208,7 +221,7 @@ class GraphicsCommandList final
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
-    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
+    explicit GraphicsCommandList(D3D12_COMMAND_LIST_TYPE type) : type_(type), debug_clear_(debug_clear_setting()) {}
     ~GraphicsCommandList() override {
         stop_recording();
         release_held();
@@ -224,6 +237,8 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
+    // The layer-heap spans of those tables (CPU address, bytes), pulled from a title-backed heap's backing first.
+    const std::vector<std::pair<std::uintptr_t, std::uint32_t>>& table_spans() const { return table_spans_; }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -261,6 +276,7 @@ public:
         invalid_ = false;
         calls_.clear();
         tables_.clear();
+        table_spans_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -716,8 +732,11 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
+        const bool magenta = debug_clear_ && !color[0] && !color[1] && !color[2] && !color[3];
         check(list_.clear_render_target(*reinterpret_cast<const leonida::TargetView*>(layer_handle(view).ptr),
-                                        {color[0], color[1], color[2], color[3]}, to_rects(count, rects)));
+                                        magenta ? leonida::ClearColor{1, 0, 1, 1}
+                                                : leonida::ClearColor{color[0], color[1], color[2], color[3]},
+                                        to_rects(count, rects)));
     }
 
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
@@ -1226,6 +1245,7 @@ private:
             va = leonida::title_va_aliases().resolve(va, kRootViewBytes, leonida::TitleVaAliases::root_view);
         else if (va && p->table_descriptors && (tables_.empty() || tables_.back().first != va))
             tables_.push_back({va, p->table_descriptors});
+        if (type == rt::rootsig::ParamType::Table && va) note_table_span(va, p->table_descriptors);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // A descriptor table is one dword at both bind points, the 32-bit VA of its first descriptor (the heaps live
@@ -1234,6 +1254,7 @@ private:
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
+    bool debug_clear_ = false;  // LEONIDA_DEBUG_CLEAR, read when the list was made
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
@@ -1244,6 +1265,7 @@ private:
     std::uintptr_t compute_pipeline_ = 0;
     std::uintptr_t graphics_pipeline_ = 0;
     bool stub_pipeline_ = false;
+    ID3D12PipelineState* last_pso_ = nullptr;  // tally_draw's key
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
@@ -1253,6 +1275,35 @@ private:
     leonida::IndexBufferView index_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    std::vector<std::pair<std::uintptr_t, std::uint32_t>> table_spans_;
+    struct HeapSpan {
+        D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+        std::uintptr_t cpu = 0;
+        std::uint64_t bytes = 0;
+    };
+    HeapSpan cbv_span_{}, sampler_span_{};
+
+    static HeapSpan heap_span(ID3D12DescriptorHeap* heap, D3D12_GPU_VIRTUAL_ADDRESS base) {
+        if (!heap) return {};
+        return {base, heap->GetCPUDescriptorHandleForHeapStart().ptr,
+                std::uint64_t(heap->GetDesc().NumDescriptors) * descriptor_size};
+    }
+
+    // A table's slots (a sampler table, which declares none here, takes 64) as a span of the bound heap holding it.
+    void note_table_span(std::uint64_t va, std::uint32_t descriptors) {
+        for (const HeapSpan& h : {cbv_span_, sampler_span_}) {
+            if (!h.cpu || va < h.gpu || va - h.gpu >= h.bytes) continue;
+            const std::uint64_t off = va - h.gpu;
+            // At least 8 slots: a console shader reads past the slots its root signature range declares (the retail
+            // full-screen pass loads table slots 0 and 2 from a 1-descriptor range).
+            const std::uint64_t want = std::uint64_t(descriptors ? std::max<std::uint32_t>(descriptors, 8) : 64) *
+                                       descriptor_size;
+            const std::uintptr_t cpu = h.cpu + std::uintptr_t(off);
+            if (table_spans_.empty() || table_spans_.back().first != cpu)
+                table_spans_.push_back({cpu, std::uint32_t(std::min(want, h.bytes - off))});
+            return;
+        }
+    }
     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
     static constexpr std::uint64_t kRootViewBytes = 65536;
     leonida::Viewport viewport_{};
@@ -1310,6 +1361,7 @@ private:
 
     void set_pipeline(ID3D12PipelineState* state) {
         hold(state);
+        last_pso_ = state;
         stub_pipeline_ = is_stub_pipeline(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
@@ -1323,6 +1375,8 @@ private:
         cbv_srv_uav_base_ = cbv_base;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        cbv_span_ = heap_span(cbv, cbv_base);
+        sampler_span_ = heap_span(smp, smp_base);
     }
 
     // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
@@ -1386,6 +1440,7 @@ private:
         sampler_heap_ = nullptr;
         cbv_srv_uav_base_ = 0;
         sampler_base_ = 0;
+        cbv_span_ = sampler_span_ = {};
         topology_ = 0;
         vertex_buffers_ = {};
         index_ = {};
@@ -1442,7 +1497,159 @@ private:
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
+    // LEONIDA_DRAW_TALLY=1 (diagnostic): draws counted by (pipeline, stub, render target 0, viewport), the top
+    // combinations printed every 50,000 draws, so a black frame's target can be matched to the pipelines that draw it.
+    void tally_draw() const {
+        static const bool on = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_DRAW_TALLY", v, sizeof v) > 0 && v[0] != '0';
+        }();
+        if (!on) return;
+        struct Key {
+            std::uintptr_t pso;
+            bool stub;
+            leonida::ResourceId rt0;
+            UINT rts;
+            int w, h;
+            bool operator<(const Key& o) const {
+                return std::tie(pso, stub, rt0, rts, w, h) < std::tie(o.pso, o.stub, o.rt0, o.rts, o.w, o.h);
+            }
+        };
+        static std::mutex m;
+        static std::map<Key, std::uint64_t> counts;
+        static std::uint64_t total = 0;
+        const Key k{reinterpret_cast<std::uintptr_t>(last_pso_), stub_pipeline_,
+                    render_target_count_ ? render_targets_[0].resource : leonida::ResourceId{0}, render_target_count_,
+                    int(viewport_.width), int(viewport_.height)};
+        std::lock_guard lock(m);
+        ++counts[k];
+        if (++total % 50000) return;
+        std::vector<std::pair<std::uint64_t, Key>> top;
+        for (const auto& [key, n] : counts) top.push_back({n, key});
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::fprintf(stderr, "[rt] d3d12: draw tally after %llu draws (%zu combinations):\n",
+                     static_cast<unsigned long long>(total), top.size());
+        for (std::size_t i = 0; i < top.size() && i < 24; ++i)
+            std::fprintf(stderr, "[rt] d3d12:   %8llu  pso=%p%s rt0=0x%llx rts=%u viewport=%dx%d\n",
+                         static_cast<unsigned long long>(top[i].first), reinterpret_cast<void*>(top[i].second.pso),
+                         top[i].second.stub ? " STUB" : "", static_cast<unsigned long long>(top[i].second.rt0),
+                         top[i].second.rts, top[i].second.w, top[i].second.h);
+    }
+
+    // LEONIDA_DRAW_TALLY=1 also dumps the first 3 draws of each pipeline: arguments, viewport, vertex and index views
+    // and the first bytes at each VA when it is readable memory (the title's own, for its CPU rings).
+    void dump_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex) const {
+        static const bool on = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_DRAW_TALLY", v, sizeof v) > 0 && v[0] != '0';
+        }();
+        if (!on) return;
+        static std::mutex m;
+        static std::map<std::uintptr_t, int> seen;
+        std::lock_guard lock(m);
+        if (++seen[reinterpret_cast<std::uintptr_t>(last_pso_)] > 3) return;
+        const auto readable = [](std::uint64_t va, std::size_t n) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            return va >= 0x10000 && VirtualQuery(reinterpret_cast<const void*>(va), &mbi, sizeof mbi) &&
+                   mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                   va + n <= reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        };
+        const auto words = [&](std::uint64_t va, std::size_t n) {
+            std::string out;
+            if (!readable(va, n)) return std::string(" (not readable)");
+            char buf[16];
+            for (std::size_t i = 0; i < n; i += 4) {
+                std::uint32_t w = 0;
+                std::memcpy(&w, reinterpret_cast<const void*>(va + i), 4);
+                std::snprintf(buf, sizeof buf, " %08x", w);
+                out += buf;
+            }
+            return out;
+        };
+        std::fprintf(stderr,
+                     "[rt] d3d12: draw dump pso=%p%s %s count=%u inst=%u first=%u base=%d topo=%u viewport=%.0f,%.0f %.0fx%.0f "
+                     "depth %.2f..%.2f rt0=0x%llx\n",
+                     static_cast<void*>(last_pso_), stub_pipeline_ ? " STUB" : "", indexed ? "indexed" : "plain", count,
+                     instances, first, base_vertex, unsigned(topology_), viewport_.x, viewport_.y, viewport_.width,
+                     viewport_.height, viewport_.min_depth, viewport_.max_depth,
+                     static_cast<unsigned long long>(render_target_count_ ? render_targets_[0].resource : 0));
+        for (std::size_t i = 0; i < vertex_buffers_.size(); ++i) {
+            const auto& v = vertex_buffers_[i];
+            if (!v.va && !v.size) continue;
+            std::fprintf(stderr, "[rt] d3d12:   vb%zu va=0x%llx size=%u stride=%u:%s\n", i,
+                         static_cast<unsigned long long>(v.va), v.size, v.stride,
+                         words(v.va + std::uint64_t(v.stride) * (indexed ? 0 : first), 64).c_str());
+        }
+        {
+            UserData data{};
+            graphics_user_data(false, data);
+            std::string sg;
+            char buf[24];
+            for (std::size_t i = 0; i < data.size() && i < 24; ++i) {
+                std::snprintf(buf, sizeof buf, " s%zu=%08x", i, unsigned(data[i]));
+                sg += buf;
+            }
+            std::fprintf(stderr, "[rt] d3d12:   user sgprs:%s heap_base=0x%llx smp_base=0x%llx\n", sg.c_str(),
+                         static_cast<unsigned long long>(cbv_srv_uav_base_),
+                         static_cast<unsigned long long>(sampler_base_));
+            const std::uint8_t* arena = g_debug_arena_host.load(std::memory_order_acquire);
+            const std::uint64_t arena_size = g_debug_arena_size.load(std::memory_order_acquire);
+            const auto arena_words = [&](std::uint64_t off, std::size_t n, bool floats) {
+                if (!arena || off >= arena_size || n > arena_size - off) return std::string(" (outside the arena)");
+                std::string out;
+                char b[24];
+                for (std::size_t i = 0; i < n; i += 4) {
+                    std::uint32_t w = 0;
+                    std::memcpy(&w, arena + off + i, 4);
+                    if (floats) {
+                        float f = 0;
+                        std::memcpy(&f, &w, 4);
+                        std::snprintf(b, sizeof b, " %g", f);
+                    } else {
+                        std::snprintf(b, sizeof b, " %08x", w);
+                    }
+                    out += b;
+                }
+                return out;
+            };
+            if (data.size() > 8) {
+                const std::uint64_t table = data[8];
+                std::fprintf(stderr, "[rt] d3d12:   arena[s8=0x%llx]:%s\n", static_cast<unsigned long long>(table),
+                             arena_words(table, 0x60, false).c_str());
+                const void* title_at = nullptr;
+                const void* layer_at = nullptr;
+                UINT stride = 0;
+                if (rt::d3d12_xs::debug_title_descriptor(table, &title_at, &layer_at, &stride))
+                    std::fprintf(stderr, "[rt] d3d12:   title backing %p (layer %p, stride %u):%s\n", title_at,
+                                 layer_at, stride, words(reinterpret_cast<std::uint64_t>(title_at), 0x60).c_str());
+                else
+                    std::fprintf(stderr, "[rt] d3d12:   s8 table is in no title-backed heap\n");
+                // The V#s the VS loads from the table (offsets 0 and 0x40): base, then the constants it reads.
+                for (std::uint64_t at : {std::uint64_t{0}, std::uint64_t{0x40}}) {
+                    if (!arena || table + at + 16 > arena_size) break;
+                    std::uint32_t v[4];
+                    std::memcpy(v, arena + table + at, 16);
+                    const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xFFFF) << 32);
+                    std::fprintf(stderr, "[rt] d3d12:   V#@+0x%llx: %08x %08x %08x %08x base=0x%llx records=%u\n",
+                                 static_cast<unsigned long long>(at), v[0], v[1], v[2], v[3],
+                                 static_cast<unsigned long long>(base), v[2]);
+                    const std::uint64_t cb_off = at ? 0x160 : 0;
+                    std::fprintf(stderr, "[rt] d3d12:     arena[base+0x%llx]:%s\n", static_cast<unsigned long long>(cb_off),
+                                 arena_words(base + cb_off, 64, true).c_str());
+                    std::fprintf(stderr, "[rt] d3d12:     cpu[base+0x%llx]:%s\n", static_cast<unsigned long long>(cb_off),
+                                 words(base + cb_off, 64).c_str());
+                }
+            }
+        }
+        if (indexed)
+            std::fprintf(stderr, "[rt] d3d12:   ib va=0x%llx size=%u fmt=%u:%s\n",
+                         static_cast<unsigned long long>(index_.va), index_.size, index_.format,
+                         words(index_.va + std::uint64_t(first) * (index_.format == 42 ? 4 : 2), 16).c_str());
+    }
+
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
+        tally_draw();
+        dump_draw(indexed, count, instances, first, base_vertex);
         if (stub_pipeline_) return;
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
@@ -1673,6 +1880,9 @@ public:
         }
         // Buffer V#s the title wrote into a bound table itself may name its own memory: rewritten to a GPU copy's
         // console VA before the copies are refreshed for this submission (src/title_va_alias.h).
+        // Descriptors the title stored into a title-backed heap's memory reach the layer heap the GPU reads.
+        for (const GraphicsCommandList* list : graphics)
+            for (const auto& [cpu, bytes] : list->table_spans()) rt::d3d12_xs::pull_title_descriptors(cpu, bytes);
         {
             std::map<std::uint64_t, std::uint32_t> tables;  // each table once, with the most slots it was bound with
             for (const GraphicsCommandList* list : graphics)
@@ -1680,17 +1890,86 @@ public:
                     tables[table] = std::max(tables[table], descriptors);
             if (!tables.empty()) {
                 const auto start = std::chrono::steady_clock::now();
-                for (const auto& [table, descriptors] : tables) leonida::title_va_aliases().scan_table(table, descriptors);
+                // As many slots as the pull brings over (note_table_span): a console shader reads past the declared range.
+                for (const auto& [table, descriptors] : tables)
+                    leonida::title_va_aliases().scan_table(table, std::max<std::uint32_t>(descriptors, 8));
                 leonida::title_va_aliases().note_scan(std::uint64_t(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                         .count()));
             }
         }
+        dump_submitted_tables(graphics);
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
                          name(last_result_));
+    }
+
+    // LEONIDA_DRAW_TALLY=1: for submissions 300-302, each bound table's layer-heap bytes after the title pull and the
+    // V# rewrite, the V#s at +0x00 and +0x40 and the first floats at their bases in the arena.
+    static void dump_submitted_tables(const std::vector<const GraphicsCommandList*>& graphics) {
+        static const bool on = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_DRAW_TALLY", v, sizeof v) > 0 && v[0] != '0';
+        }();
+        if (!on) return;
+        static std::atomic<std::uint64_t> submissions{0};
+        const std::uint64_t n = ++submissions;
+        // Submission 300's table backings, read again at 301-310: is the title still writing them after the submit?
+        static std::vector<const std::uint32_t*> watched;
+        if (n > 300 && n <= 310) {
+            for (const std::uint32_t* t : watched) {
+                std::fprintf(stderr, "[rt] d3d12: at submit %llu, submit 300's backing %p:", static_cast<unsigned long long>(n),
+                             static_cast<const void*>(t));
+                for (std::uint32_t i = 0; i < 24; ++i) std::fprintf(stderr, " %08x", t[i]);
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (n < 300 || n > 302) return;
+        const std::uint8_t* arena = g_debug_arena_host.load(std::memory_order_acquire);
+        const std::uint64_t arena_size = g_debug_arena_size.load(std::memory_order_acquire);
+        for (const GraphicsCommandList* list : graphics) {
+            for (const auto& [cpu, bytes] : list->table_spans()) {
+                const auto* d = reinterpret_cast<const std::uint32_t*>(cpu);
+                std::fprintf(stderr, "[rt] d3d12: submit %llu table span %p (%u bytes):", static_cast<unsigned long long>(n),
+                             reinterpret_cast<const void*>(cpu), bytes);
+                for (std::uint32_t i = 0; i < 24; ++i) std::fprintf(stderr, " %08x", d[i]);
+                std::fprintf(stderr, "\n");
+                {
+                    const void* title_at = nullptr;
+                    const void* layer_at = nullptr;
+                    UINT stride = 0;
+                    // The span's GPU handle: the layer CPU address maps 1:1 to the GPU offset inside the heap.
+                    const std::uint64_t arena_off =
+                        arena ? std::uint64_t(cpu - reinterpret_cast<std::uintptr_t>(arena)) : 0;
+                    if (rt::d3d12_xs::debug_title_descriptor(arena_off, &title_at, &layer_at, &stride)) {
+                        const auto* t = static_cast<const std::uint32_t*>(title_at);
+                        if (n == 300) watched.push_back(t);
+                        std::fprintf(stderr, "[rt] d3d12:   title backing %p:", title_at);
+                        for (std::uint32_t i = 0; i < 24; ++i) std::fprintf(stderr, " %08x", t[i]);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+                for (std::uint32_t at : {0u, 0x40u}) {
+                    const std::uint32_t* v = d + at / 4;
+                    const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xFFFF) << 32);
+                    std::fprintf(stderr, "[rt] d3d12:   V#@+0x%x base=0x%llx records=%u w3=%08x:", at,
+                                 static_cast<unsigned long long>(base), v[2], v[3]);
+                    if (arena && base && base < arena_size && arena_size - base >= 0x1a0) {
+                        const std::uint64_t first = at ? 0x160 : 0;
+                        for (int i = 0; i < 16; ++i) {
+                            float f = 0;
+                            std::memcpy(&f, arena + base + first + 4 * i, 4);
+                            std::fprintf(stderr, " %g", f);
+                        }
+                    } else {
+                        std::fprintf(stderr, " (base outside the arena)");
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
